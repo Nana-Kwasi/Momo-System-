@@ -10,7 +10,7 @@ import { Badge } from "../components/ui/badge";
 import { AlertCircle, CheckCircle, XCircle, Plus } from "lucide-react";
 
 export default function Reconciliation() {
-  const { userData } = useAuth();
+  const { userData, selectedBranchId, selectedBusinessId } = useAuth();
   const [loading, setLoading] = useState(false);
   const [loadingBalances, setLoadingBalances] = useState(true);
   const [noDataMessage, setNoDataMessage] = useState("");
@@ -47,21 +47,23 @@ export default function Reconciliation() {
   });
 
   useEffect(() => {
-    if (userData?.branchId) {
+    const branchId = selectedBranchId || userData?.branchId;
+    if (branchId) {
       loadMerchantSims();
-      setLoadingBalances(true);
-      loadSystemBalances();
+      loadSystemBalances(); // This will set loading to true internally
       // Auto-refresh every 1 minute to get latest transactions
       const interval = setInterval(() => {
         loadSystemBalances();
       }, 60000); // 60 seconds (1 minute)
       return () => clearInterval(interval);
     }
-  }, [userData?.branchId]);
+  }, [selectedBranchId, userData?.branchId]);
 
   const loadMerchantSims = async () => {
     try {
-      const sims = await merchantSimService.getByBranch(userData.branchId);
+      const branchId = selectedBranchId || userData?.branchId;
+      if (!branchId) return;
+      const sims = await merchantSimService.getByBranch(branchId);
       setMerchantSims(sims);
     } catch (error) {
       console.error("Error loading merchant SIMs:", error);
@@ -74,8 +76,13 @@ export default function Reconciliation() {
       return;
     }
     try {
+      const branchId = selectedBranchId || userData?.branchId;
+      if (!branchId) {
+        alert("Branch ID is missing. Please ensure you're properly assigned to a branch.");
+        return;
+      }
       await merchantSimService.create({
-        branchId: userData.branchId,
+        branchId,
         provider: newMerchantSim.provider,
         simName: newMerchantSim.simName,
         agentNumber: newMerchantSim.agentNumber,
@@ -101,17 +108,34 @@ export default function Reconciliation() {
     const loadTimestamp = Date.now();
     loadTimestampRef.current = loadTimestamp;
     
+    // Get branchId with fallback
+    const branchId = selectedBranchId || userData?.branchId;
+    
     // Clear any previous no data message
     setNoDataMessage("");
     setLoadingBalances(true);
     
-    // Set overall timeout of 10 seconds
+    // Validate branchId exists
+    if (!branchId) {
+      setLoadingBalances(false);
+      setNoDataMessage("Branch ID is missing. Please ensure you're properly assigned to a branch.");
+      return;
+    }
+    
+    // Set overall timeout of 10 seconds - ensure loading always stops
     const overallTimeout = setTimeout(() => {
       if (loadTimestampRef.current === loadTimestamp) {
         setLoadingBalances(false);
         setNoDataMessage("No data update was found. Please check your connection or try again.");
       }
     }, 10000);
+    
+    // Helper to safely stop loading - always stops loading, but only updates data if timestamp matches
+    const stopLoading = () => {
+      clearTimeout(overallTimeout);
+      // Always stop loading, regardless of timestamp (prevents infinite loading)
+      setLoadingBalances(false);
+    };
     
     try {
       const today = new Date().toISOString().split("T")[0]; // Always use today's date
@@ -126,9 +150,9 @@ export default function Reconciliation() {
       let dataFound = false;
       
       try {
-        const floatPromise = dailyFloatService.getByBranchAndDate(userData.branchId, todayDate);
+        const floatPromise = dailyFloatService.getByBranchAndDate(branchId, todayDate);
         float = await Promise.race([floatPromise, timeoutPromise]);
-      if (float) {
+        if (float) {
           dataFound = true;
         }
       } catch (floatError) {
@@ -137,8 +161,8 @@ export default function Reconciliation() {
       }
       
       if (!float) {
-        // No float for today, clear system balances
-        clearTimeout(overallTimeout);
+        // No float for today, clear system balances and stop loading immediately
+        stopLoading();
         setFormData((prev) => ({
           ...prev,
           date: today,
@@ -149,7 +173,6 @@ export default function Reconciliation() {
           systemTelecelEcash: "",
           systemMerchantSimEcash: {},
         }));
-        setLoadingBalances(false);
         if (loadTimestampRef.current === loadTimestamp) {
           setNoDataMessage("No opening float found for today. Please create an opening float first.");
         }
@@ -164,7 +187,7 @@ export default function Reconciliation() {
       // For admins, pass null userId to get all transactions
       // For normal users, pass their userId to get only their transactions
       const transactionsPromise = transactionService.getTodayTransactions(
-        userData.branchId,
+        branchId,
         isAdmin ? null : userData.userId,
         isAdmin ? "admin" : userData.role
       );
@@ -282,33 +305,39 @@ export default function Reconciliation() {
       
       console.log("Reconciliation: Setting new balances:", newSystemBalances);
       
-      // Only update if this is still the latest load (prevent stale updates)
+      // Always stop loading when we have a result
+      stopLoading();
+      
+      // Only update form data if this is still the latest load (prevent stale updates)
       if (loadTimestampRef.current === loadTimestamp) {
-        clearTimeout(overallTimeout);
         setFormData((prev) => ({
           ...prev,
           date: today, // Ensure date is always today
           ...newSystemBalances, // Completely replace system balances
         }));
-        setLoadingBalances(false);
         // Don't show no data message if we found data
         if (dataFound) {
           setNoDataMessage("");
         }
       } else {
         console.warn("Reconciliation: Skipping stale update, newer load in progress");
-        clearTimeout(overallTimeout);
-        setLoadingBalances(false);
       }
     } catch (error) {
       console.error("Error loading system balances:", error);
-      clearTimeout(overallTimeout);
       
       // If transaction query fails, at least show opening float balances
       try {
         const today = new Date().toISOString().split("T")[0];
         const todayDate = new Date(today);
-        const float = await dailyFloatService.getByBranchAndDate(userData.branchId, todayDate);
+        const branchId = selectedBranchId || userData?.branchId;
+        if (!branchId) {
+          setLoadingBalances(false);
+          if (loadTimestampRef.current === loadTimestamp) {
+            setNoDataMessage("Branch ID is missing. Please ensure you're properly assigned to a branch.");
+          }
+          return;
+        }
+        const float = await dailyFloatService.getByBranchAndDate(branchId, todayDate);
         if (float) {
           const merchantSimBalances = {};
           if (float.openingMerchantSimEcash && typeof float.openingMerchantSimEcash === 'object') {
@@ -326,21 +355,20 @@ export default function Reconciliation() {
             systemTelecelEcash: parseFloat(float.openingTelecelEcash || 0).toFixed(2),
             systemMerchantSimEcash: merchantSimBalances,
           }));
-          setLoadingBalances(false);
           console.warn("Showing opening balances only. Transaction query failed - check Firestore indexes.");
         } else {
-          setLoadingBalances(false);
           if (loadTimestampRef.current === loadTimestamp) {
             setNoDataMessage("An error occurred while loading data. Please try again.");
           }
         }
       } catch (fallbackError) {
         console.error("Fallback error:", fallbackError);
-        // Even if fallback fails, clear loading state
-        setLoadingBalances(false);
         if (loadTimestampRef.current === loadTimestamp) {
           setNoDataMessage("Unable to load data. Please check your connection and try again.");
         }
+      } finally {
+        // Always stop loading in finally block
+        stopLoading();
       }
     }
   };
@@ -398,10 +426,17 @@ export default function Reconciliation() {
     }
     setLoading(true);
     try {
+      const businessId = selectedBusinessId || userData?.businessId;
+      const branchId = selectedBranchId || userData?.branchId;
+      if (!businessId || !branchId) {
+        alert("Business ID or Branch ID is missing. Please ensure you're properly assigned.");
+        setLoading(false);
+        return;
+      }
       const status = Math.abs(totalVariance) > 0.02 ? "escalated" : "pending";
       await reconciliationService.create({
-        businessId: userData.businessId,
-        branchId: userData.branchId,
+        businessId,
+        branchId,
         ...formData,
         totalVariance,
         reconciledBy: userData.userId,
