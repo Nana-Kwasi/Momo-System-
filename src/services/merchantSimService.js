@@ -14,17 +14,33 @@ const generateId = () => doc(collection(db, "_temp")).id;
 
 export const merchantSimService = {
   async create(data) {
+    // Validate required fields
+    if (!data.branchId) {
+      throw new Error("branchId is required");
+    }
+    if (!data.provider) {
+      throw new Error("provider is required");
+    }
+    if (!data.simName) {
+      throw new Error("simName is required");
+    }
+    
     const merchantSimId = generateId();
     const merchantSimData = {
       merchantSimId,
       branchId: data.branchId,
       provider: data.provider, // MTN, Vodafone, AirtelTigo, Telecel
-      simName: data.simName, // e.g., "MTN33", "MTN34"
-      agentNumber: data.agentNumber || "",
+      simName: data.simName.trim(), // e.g., "MTN33", "MTN34"
+      agentNumber: (data.agentNumber || "").trim(),
       createdAt: Timestamp.now(),
       status: "active",
-      ...data,
     };
+    
+    // Only add optional fields if they have values
+    if (data.businessId) {
+      merchantSimData.businessId = data.businessId;
+    }
+    
     await addDoc(collection(db, "merchant_sims"), merchantSimData);
     return merchantSimId;
   },

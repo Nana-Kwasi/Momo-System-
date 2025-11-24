@@ -13,6 +13,7 @@ export default function Reconciliation() {
   const { userData } = useAuth();
   const [loading, setLoading] = useState(false);
   const [loadingBalances, setLoadingBalances] = useState(true);
+  const [noDataMessage, setNoDataMessage] = useState("");
   const loadTimestampRef = useRef(0); // Track when load was initiated to prevent stale updates
   const [merchantSims, setMerchantSims] = useState([]);
   const [showAddMerchantSim, setShowAddMerchantSim] = useState({ provider: "", visible: false });
@@ -100,21 +101,44 @@ export default function Reconciliation() {
     const loadTimestamp = Date.now();
     loadTimestampRef.current = loadTimestamp;
     
+    // Clear any previous no data message
+    setNoDataMessage("");
+    setLoadingBalances(true);
+    
+    // Set overall timeout of 10 seconds
+    const overallTimeout = setTimeout(() => {
+      if (loadTimestampRef.current === loadTimestamp) {
+        setLoadingBalances(false);
+        setNoDataMessage("No data update was found. Please check your connection or try again.");
+      }
+    }, 10000);
+    
     try {
-      setLoadingBalances(true);
       const today = new Date().toISOString().split("T")[0]; // Always use today's date
       const todayDate = new Date(today);
       
-      // Add timeout to prevent hanging
+      // Add timeout to prevent hanging (8 seconds to leave buffer for overall timeout)
       const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error("Request timeout")), 15000)
+        setTimeout(() => reject(new Error("Request timeout")), 8000)
       );
       
-      const floatPromise = dailyFloatService.getByBranchAndDate(userData.branchId, todayDate);
-      const float = await Promise.race([floatPromise, timeoutPromise]);
+      let float;
+      let dataFound = false;
+      
+      try {
+        const floatPromise = dailyFloatService.getByBranchAndDate(userData.branchId, todayDate);
+        float = await Promise.race([floatPromise, timeoutPromise]);
+      if (float) {
+          dataFound = true;
+        }
+      } catch (floatError) {
+        console.warn("Float query failed or timed out:", floatError);
+        float = null;
+      }
       
       if (!float) {
         // No float for today, clear system balances
+        clearTimeout(overallTimeout);
         setFormData((prev) => ({
           ...prev,
           date: today,
@@ -123,8 +147,12 @@ export default function Reconciliation() {
           systemVodafoneEcash: "",
           systemAirtelTigoEcash: "",
           systemTelecelEcash: "",
+          systemMerchantSimEcash: {},
         }));
         setLoadingBalances(false);
+        if (loadTimestampRef.current === loadTimestamp) {
+          setNoDataMessage("No opening float found for today. Please create an opening float first.");
+        }
         return;
       }
 
@@ -141,15 +169,18 @@ export default function Reconciliation() {
         isAdmin ? "admin" : userData.role
       );
       
-      // Separate timeout for transactions (10 seconds)
+      // Separate timeout for transactions (7 seconds to leave buffer)
       const transactionsTimeout = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error("Transaction query timeout")), 10000)
+        setTimeout(() => reject(new Error("Transaction query timeout")), 7000)
       );
       
       let transactions;
       try {
         transactions = await Promise.race([transactionsPromise, transactionsTimeout]);
         console.log("Reconciliation: Loaded transactions successfully:", transactions?.momo?.length || 0, "MoMo,", transactions?.bank?.length || 0, "Bank");
+        if (transactions && (transactions.momo?.length > 0 || transactions.bank?.length > 0)) {
+          dataFound = true;
+        }
       } catch (transError) {
         console.warn("Transaction query failed or timed out:", transError);
         // If transaction query fails, use empty array and show opening balances only
@@ -164,7 +195,7 @@ export default function Reconciliation() {
       }
       
       // Start with opening float balances
-      let physicalCash = parseFloat(float.openingPhysicalCash || 0);
+        let physicalCash = parseFloat(float.openingPhysicalCash || 0);
       
       // Initialize merchant SIM balances from opening float
       const merchantSimBalances = {};
@@ -175,10 +206,10 @@ export default function Reconciliation() {
       }
       
       // Fallback to provider-level balances if merchant SIM data not available
-      let mtnEcash = parseFloat(float.openingMtnEcash || 0);
-      let vodafoneEcash = parseFloat(float.openingVodafoneEcash || 0);
-      let airtelTigoEcash = parseFloat(float.openingAirtelTigoEcash || 0);
-      let telecelEcash = parseFloat(float.openingTelecelEcash || 0);
+        let mtnEcash = parseFloat(float.openingMtnEcash || 0);
+        let vodafoneEcash = parseFloat(float.openingVodafoneEcash || 0);
+        let airtelTigoEcash = parseFloat(float.openingAirtelTigoEcash || 0);
+        let telecelEcash = parseFloat(float.openingTelecelEcash || 0);
 
       // Apply all transactions to calculate current balances
       console.log("Reconciliation: Found transactions:", transactions?.momo?.length || 0, "MoMo transactions");
@@ -203,10 +234,10 @@ export default function Reconciliation() {
               merchantSimBalances[t.merchantSimId] -= amount;
             } else {
               // Fallback to provider-level tracking
-              if (t.provider === "MTN") mtnEcash -= amount;
-              else if (t.provider === "Vodafone") vodafoneEcash -= amount;
-              else if (t.provider === "AirtelTigo") airtelTigoEcash -= amount;
-              else if (t.provider === "Telecel") telecelEcash -= amount;
+            if (t.provider === "MTN") mtnEcash -= amount;
+            else if (t.provider === "Vodafone") vodafoneEcash -= amount;
+            else if (t.provider === "AirtelTigo") airtelTigoEcash -= amount;
+            else if (t.provider === "Telecel") telecelEcash -= amount;
             }
           } 
           // Cash Out: Customer receives physical cash → Customer credits agent E-Cash
@@ -253,16 +284,25 @@ export default function Reconciliation() {
       
       // Only update if this is still the latest load (prevent stale updates)
       if (loadTimestampRef.current === loadTimestamp) {
+        clearTimeout(overallTimeout);
         setFormData((prev) => ({
           ...prev,
           date: today, // Ensure date is always today
           ...newSystemBalances, // Completely replace system balances
         }));
+        setLoadingBalances(false);
+        // Don't show no data message if we found data
+        if (dataFound) {
+          setNoDataMessage("");
+        }
       } else {
         console.warn("Reconciliation: Skipping stale update, newer load in progress");
+        clearTimeout(overallTimeout);
+        setLoadingBalances(false);
       }
     } catch (error) {
       console.error("Error loading system balances:", error);
+      clearTimeout(overallTimeout);
       
       // If transaction query fails, at least show opening float balances
       try {
@@ -286,13 +326,22 @@ export default function Reconciliation() {
             systemTelecelEcash: parseFloat(float.openingTelecelEcash || 0).toFixed(2),
             systemMerchantSimEcash: merchantSimBalances,
           }));
+          setLoadingBalances(false);
           console.warn("Showing opening balances only. Transaction query failed - check Firestore indexes.");
+        } else {
+          setLoadingBalances(false);
+          if (loadTimestampRef.current === loadTimestamp) {
+            setNoDataMessage("An error occurred while loading data. Please try again.");
+          }
         }
       } catch (fallbackError) {
         console.error("Fallback error:", fallbackError);
+        // Even if fallback fails, clear loading state
+        setLoadingBalances(false);
+        if (loadTimestampRef.current === loadTimestamp) {
+          setNoDataMessage("Unable to load data. Please check your connection and try again.");
+        }
       }
-    } finally {
-      setLoadingBalances(false);
     }
   };
 
@@ -410,6 +459,13 @@ export default function Reconciliation() {
               ⚠️ Only today's reconciliation is allowed. Date has been reset to today.
             </p>
           </div>
+        )}
+        {noDataMessage && (
+          <Card className="mt-4 border-orange-200 bg-orange-50">
+            <CardContent className="pt-6">
+              <p className="text-sm text-orange-800">{noDataMessage}</p>
+            </CardContent>
+          </Card>
         )}
       </div>
 
@@ -550,23 +606,23 @@ export default function Reconciliation() {
                           return (
                             <div key={sim.merchantSimId} className="border rounded-md p-3">
                               <h5 className="font-medium mb-2">{sim.simName}</h5>
-                              <div className="grid gap-4 md:grid-cols-2">
-                                <div className="space-y-2">
-                                  <Label>System Balance (GHS) *</Label>
-                                  <Input
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <div className="space-y-2">
+                      <Label>System Balance (GHS) *</Label>
+                      <Input
                                     type="text"
                                     value={systemValue}
                                     readOnly
                                     className="bg-muted"
-                                    required
-                                  />
+                        required
+                      />
                                   <p className="text-xs text-muted-foreground">
                                     Auto-calculated from opening balance + all {sim.simName} transactions
                                   </p>
-                                </div>
-                                <div className="space-y-2">
-                                  <Label>Actual Balance (GHS) *</Label>
-                                  <Input
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Actual Balance (GHS) *</Label>
+                      <Input
                                     type="text"
                                     inputMode="decimal"
                                     value={actualValue}
@@ -592,31 +648,31 @@ export default function Reconciliation() {
                                         setFormData({ ...formData, actualMerchantSimEcash: updated });
                                       }
                                     }}
-                                    required
-                                  />
-                                </div>
-                              </div>
-                              <div className="mt-2">
-                                <div className="flex items-center gap-2">
+                        required
+                      />
+                    </div>
+                  </div>
+                  <div className="mt-2">
+                    <div className="flex items-center gap-2">
                                   {Math.abs(variance) > 0.02 ? (
-                                    <XCircle className="h-4 w-4 text-red-600" />
+                        <XCircle className="h-4 w-4 text-red-600" />
                                   ) : Math.abs(variance) > 0 ? (
-                                    <AlertCircle className="h-4 w-4 text-yellow-600" />
-                                  ) : (
-                                    <CheckCircle className="h-4 w-4 text-green-600" />
-                                  )}
-                                  <p className="text-sm">
-                                    Difference:{" "}
+                        <AlertCircle className="h-4 w-4 text-yellow-600" />
+                      ) : (
+                        <CheckCircle className="h-4 w-4 text-green-600" />
+                      )}
+                    <p className="text-sm">
+                      Difference:{" "}
                                     <span className={Math.abs(variance) > 0.02 ? "text-red-600 font-bold" : "text-green-600"}>
                                       GHS {variance.toLocaleString()}
-                                    </span>
-                                  </p>
-                                </div>
+                      </span>
+                    </p>
+                    </div>
                                 {actualValue && Math.abs(variance) > 0 && (
-                                  <div className="mt-2">
+                      <div className="mt-2">
                                     <Label htmlFor={`variance_${sim.merchantSimId}`}>
                                       {sim.simName} Variance Reason *
-                                    </Label>
+                        </Label>
                                     <Input
                                       id={`variance_${sim.merchantSimId}`}
                                       value={formData.merchantSimVarianceReason?.[sim.merchantSimId] || ""}

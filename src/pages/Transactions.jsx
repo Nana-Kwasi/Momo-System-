@@ -10,7 +10,7 @@ import { Select } from "../components/ui/select";
 import { Plus } from "lucide-react";
 
 export default function Transactions() {
-  const { userData } = useAuth();
+  const { userData, selectedBranchId, selectedBusinessId } = useAuth();
   const [activeForm, setActiveForm] = useState(null);
   const [loading, setLoading] = useState(false);
   const [branchData, setBranchData] = useState(null);
@@ -23,19 +23,30 @@ export default function Transactions() {
     vodafoneEcash: 0,
     airtelTigoEcash: 0,
     telecelEcash: 0,
+    merchantSimEcash: {}, // Store balances per merchant SIM ID
   });
 
   useEffect(() => {
-    if (userData?.branchId) {
+    const branchId = selectedBranchId || userData?.branchId;
+    if (branchId) {
       loadBranchData();
       loadMerchantSims();
       loadCurrentBalances();
     }
-  }, [userData?.branchId]);
+  }, [userData?.branchId, selectedBranchId]);
+
+  // Helper function to get businessId and branchId with fallbacks
+  const getBusinessAndBranchIds = () => {
+    const businessId = selectedBusinessId || userData?.businessId;
+    const branchId = selectedBranchId || userData?.branchId;
+    return { businessId, branchId };
+  };
 
   const loadBranchData = async () => {
     try {
-      const branch = await branchService.getById(userData.branchId);
+      const { branchId } = getBusinessAndBranchIds();
+      if (!branchId) return;
+      const branch = await branchService.getById(branchId);
       setBranchData(branch);
     } catch (error) {
       console.error("Error loading branch:", error);
@@ -44,7 +55,13 @@ export default function Transactions() {
 
   const loadMerchantSims = async () => {
     try {
-      const sims = await merchantSimService.getByBranch(userData.branchId);
+      const branchId = selectedBranchId || userData?.branchId;
+      if (!branchId) {
+        console.warn("No branchId available to load merchant SIMs");
+        return;
+      }
+      const sims = await merchantSimService.getByBranch(branchId);
+      console.log("Loaded merchant SIMs:", sims);
       setMerchantSims(sims);
     } catch (error) {
       console.error("Error loading merchant SIMs:", error);
@@ -56,64 +73,111 @@ export default function Transactions() {
       alert("Please provide provider and SIM name");
       return;
     }
+    
+    const branchId = selectedBranchId || userData?.branchId;
+    if (!branchId) {
+      alert("Error: Branch ID is not available. Please ensure you're assigned to a branch.");
+      return;
+    }
+    
     try {
       await merchantSimService.create({
-        branchId: userData.branchId,
+        branchId: branchId,
         provider: newMerchantSim.provider,
         simName: newMerchantSim.simName,
-        agentNumber: newMerchantSim.agentNumber,
+        agentNumber: newMerchantSim.agentNumber || "",
       });
       await loadMerchantSims();
       setNewMerchantSim({ provider: "", simName: "", agentNumber: "" });
       setShowAddMerchantSim(false);
       alert("Merchant SIM added successfully!");
     } catch (error) {
+      console.error("Error adding merchant SIM:", error);
       alert("Error adding merchant SIM: " + error.message);
     }
   };
 
   const loadCurrentBalances = async () => {
     try {
+      const branchId = selectedBranchId || userData?.branchId;
+      if (!branchId) return;
+      
       const today = new Date();
-      const float = await dailyFloatService.getByBranchAndDate(userData.branchId, today);
+      const float = await dailyFloatService.getByBranchAndDate(branchId, today);
       if (float) {
-        const transactions = await transactionService.getTodayTransactions(userData.branchId, userData.userId, userData.role);
+        const transactions = await transactionService.getTodayTransactions(branchId, userData.userId, userData.role);
         
+        // Start with opening physical cash
         let physicalCash = parseFloat(float.openingPhysicalCash || 0);
+        console.log("Transactions: Opening physical cash from float:", float.openingPhysicalCash, "Parsed:", physicalCash);
+        
+        // Initialize merchant SIM balances from opening float
+        const merchantSimBalances = {};
+        if (float.openingMerchantSimEcash && typeof float.openingMerchantSimEcash === 'object') {
+          Object.keys(float.openingMerchantSimEcash).forEach(simId => {
+            merchantSimBalances[simId] = parseFloat(float.openingMerchantSimEcash[simId] || 0);
+          });
+          console.log("Transactions: Loaded merchant SIM balances:", merchantSimBalances);
+        } else {
+          console.warn("Transactions: No openingMerchantSimEcash found in float");
+        }
+        
+        // Fallback to provider-level balances if merchant SIM data not available
         let mtnEcash = parseFloat(float.openingMtnEcash || 0);
         let vodafoneEcash = parseFloat(float.openingVodafoneEcash || 0);
         let airtelTigoEcash = parseFloat(float.openingAirtelTigoEcash || 0);
         let telecelEcash = parseFloat(float.openingTelecelEcash || 0);
 
-        transactions.momo.forEach((t) => {
-          const amount = parseFloat(t.amount || 0);
-          // Cash In: Customer gives physical cash → Agent credits customer E-Cash
-          // Physical Cash increases, E-Cash decreases
-          if (t.transactionType === "cash_in") {
-            physicalCash += amount; // Agent receives physical cash
-            if (t.provider === "MTN") mtnEcash -= amount; // Agent's E-Cash decreases
-            else if (t.provider === "Vodafone") vodafoneEcash -= amount;
-            else if (t.provider === "AirtelTigo") airtelTigoEcash -= amount;
-            else if (t.provider === "Telecel") telecelEcash -= amount;
-          } 
-          // Cash Out: Customer receives physical cash → Customer credits agent E-Cash
-          // Physical Cash decreases, E-Cash increases
-          else if (t.transactionType === "cash_out") {
-            physicalCash -= amount; // Agent gives physical cash
-            if (t.provider === "MTN") mtnEcash += amount; // Agent's E-Cash increases
-            else if (t.provider === "Vodafone") vodafoneEcash += amount;
-            else if (t.provider === "AirtelTigo") airtelTigoEcash += amount;
-            else if (t.provider === "Telecel") telecelEcash += amount;
-          }
-        });
+        // Apply all transactions to calculate current balances
+        if (transactions?.momo && Array.isArray(transactions.momo)) {
+          transactions.momo.forEach((t) => {
+            const amount = parseFloat(t.amount || 0);
+            if (isNaN(amount) || amount <= 0) return;
+            
+            // Cash In: Customer gives physical cash → Agent credits customer E-Cash
+            // Physical Cash increases, E-Cash decreases
+            if (t.transactionType === "cash_in") {
+              physicalCash += amount; // Agent receives physical cash
+              // If transaction has merchant SIM, update that specific SIM balance
+              if (t.merchantSimId && merchantSimBalances.hasOwnProperty(t.merchantSimId)) {
+                merchantSimBalances[t.merchantSimId] -= amount;
+              } else {
+                // Fallback to provider-level tracking
+                if (t.provider === "MTN") mtnEcash -= amount;
+                else if (t.provider === "Vodafone") vodafoneEcash -= amount;
+                else if (t.provider === "AirtelTigo") airtelTigoEcash -= amount;
+                else if (t.provider === "Telecel") telecelEcash -= amount;
+              }
+            } 
+            // Cash Out: Customer receives physical cash → Customer credits agent E-Cash
+            // Physical Cash decreases, E-Cash increases
+            else if (t.transactionType === "cash_out") {
+              physicalCash -= amount; // Agent gives physical cash
+              // If transaction has merchant SIM, update that specific SIM balance
+              if (t.merchantSimId && merchantSimBalances.hasOwnProperty(t.merchantSimId)) {
+                merchantSimBalances[t.merchantSimId] += amount;
+              } else {
+                // Fallback to provider-level tracking
+                if (t.provider === "MTN") mtnEcash += amount;
+                else if (t.provider === "Vodafone") vodafoneEcash += amount;
+                else if (t.provider === "AirtelTigo") airtelTigoEcash += amount;
+                else if (t.provider === "Telecel") telecelEcash += amount;
+              }
+            }
+          });
+        }
 
+        console.log("Transactions: Setting current balances - Physical:", physicalCash, "Merchant SIMs:", merchantSimBalances);
         setCurrentBalances({
           physicalCash,
           mtnEcash,
           vodafoneEcash,
           airtelTigoEcash,
           telecelEcash,
+          merchantSimEcash: merchantSimBalances,
         });
+      } else {
+        console.warn("Transactions: No float found for today");
       }
     } catch (error) {
       console.error("Error loading balances:", error);
@@ -131,7 +195,13 @@ export default function Transactions() {
     return providerMap[provider] || "";
   };
 
-  const getEcashBalance = (provider) => {
+  const getEcashBalance = (provider, merchantSimId = null) => {
+    // If merchant SIM is selected, return its balance from openingMerchantSimEcash
+    if (merchantSimId && currentBalances.merchantSimEcash && currentBalances.merchantSimEcash[merchantSimId] !== undefined) {
+      return currentBalances.merchantSimEcash[merchantSimId];
+    }
+    
+    // Fallback to provider-level balances
     const providerMap = {
       MTN: currentBalances.mtnEcash,
       Vodafone: currentBalances.vodafoneEcash,
@@ -173,7 +243,8 @@ export default function Transactions() {
       
       const amount = roundTo2(parseFloat(momoForm.amount || 0));
       const physicalBefore = roundTo2(parseFloat(momoForm.physicalCashBefore || currentBalances.physicalCash));
-      const ecashBefore = roundTo2(parseFloat(momoForm.ecashBefore || getEcashBalance(momoForm.provider)));
+      // Use merchant SIM balance if merchant SIM is selected, otherwise use provider balance
+      const ecashBefore = roundTo2(parseFloat(momoForm.ecashBefore || getEcashBalance(momoForm.provider, momoForm.merchantSimId)));
       
       let physicalAfter = physicalBefore;
       let ecashAfter = ecashBefore;
@@ -191,9 +262,17 @@ export default function Transactions() {
         ecashAfter = roundTo2(ecashBefore + amount); // Agent's E-Cash increases (customer credits agent)
       }
 
+      const { businessId, branchId } = getBusinessAndBranchIds();
+      
+      if (!businessId || !branchId) {
+        alert("Error: Business ID or Branch ID is missing. Please ensure you're properly assigned.");
+        setLoading(false);
+        return;
+      }
+      
       await transactionService.createMoMoTransaction({
-        businessId: userData.businessId,
-        branchId: userData.branchId,
+        businessId,
+        branchId,
         ...momoForm,
         agentNumber: momoForm.agentNumber || getAgentNumber(momoForm.provider),
         physicalCashBefore: physicalBefore,
@@ -428,6 +507,8 @@ export default function Transactions() {
                         merchantSimId: "",
                         merchantSimName: ""
                       });
+                      // Reload merchant SIMs when provider changes to ensure we have latest data
+                      loadMerchantSims();
                     }}
                     required
                   >
@@ -446,23 +527,31 @@ export default function Transactions() {
                           id="merchantSim"
                           value={momoForm.merchantSimId}
                           onChange={(e) => {
-                            const selectedSim = merchantSims.find(s => s.merchantSimId === e.target.value);
+                            const selectedSim = merchantSims.find(s => (s.merchantSimId || s.id) === e.target.value);
                             setMomoForm({ 
                               ...momoForm, 
                               merchantSimId: e.target.value,
-                              merchantSimName: selectedSim?.simName || ""
+                              merchantSimName: selectedSim?.simName || "",
+                              // Reset ecashBefore so it recalculates with new merchant SIM
+                              ecashBefore: ""
                             });
+                            // Reload balances to get latest merchant SIM balance
+                            loadCurrentBalances();
                           }}
                           required
                         >
                           <option value="">Select Merchant SIM</option>
-                          {merchantSims
-                            .filter(sim => sim.provider === momoForm.provider)
-                            .map((sim) => (
-                              <option key={sim.merchantSimId} value={sim.merchantSimId}>
-                                {sim.simName}
-                              </option>
-                            ))}
+                          {merchantSims && merchantSims.length > 0 ? (
+                            merchantSims
+                              .filter(sim => sim.provider === momoForm.provider)
+                              .map((sim) => (
+                                <option key={sim.merchantSimId || sim.id} value={sim.merchantSimId || sim.id}>
+                                  {sim.simName}
+                                </option>
+                              ))
+                          ) : (
+                            <option value="" disabled>No merchant SIMs found for {momoForm.provider}. Click + to add.</option>
+                          )}
                         </Select>
                       </div>
                       <Button
@@ -642,7 +731,7 @@ export default function Transactions() {
                     id="ecashBefore"
                     type="number"
                     step="0.01"
-                    value={momoForm.ecashBefore || getEcashBalance(momoForm.provider)}
+                    value={momoForm.ecashBefore || getEcashBalance(momoForm.provider, momoForm.merchantSimId)}
                     onChange={(e) => setMomoForm({ ...momoForm, ecashBefore: e.target.value })}
                     readOnly
                   />
@@ -655,7 +744,7 @@ export default function Transactions() {
                     step="0.01"
                     value={momoForm.ecashAfter || (() => {
                       const roundTo2 = (num) => Math.round((num + Number.EPSILON) * 100) / 100;
-                      const before = roundTo2(getEcashBalance(momoForm.provider));
+                      const before = roundTo2(getEcashBalance(momoForm.provider, momoForm.merchantSimId));
                       const amount = roundTo2(parseFloat(momoForm.amount || 0));
                       if (momoForm.transactionType === "cash_in") return roundTo2(before - amount); // E-Cash decreases (agent credits customer)
                       if (momoForm.transactionType === "cash_out") return roundTo2(before + amount); // E-Cash increases (customer credits agent)
@@ -731,9 +820,15 @@ export default function Transactions() {
                     physicalAfter = physicalBefore - amount;
                   }
 
+                  const { businessId, branchId } = getBusinessAndBranchIds();
+                  if (!businessId || !branchId) {
+                    alert("Error: Business ID or Branch ID is missing.");
+                    setLoading(false);
+                    return;
+                  }
                   await transactionService.createBankTransaction({
-                    businessId: userData.businessId,
-                    branchId: userData.branchId,
+                    businessId,
+                    branchId,
                     ...bankForm,
                     physicalCashBefore: physicalBefore,
                     physicalCashAfter: physicalAfter,
@@ -981,9 +1076,15 @@ export default function Transactions() {
                 e.preventDefault();
                 setLoading(true);
                 try {
+                  const { businessId, branchId } = getBusinessAndBranchIds();
+                  if (!businessId || !branchId) {
+                    alert("Error: Business ID or Branch ID is missing.");
+                    setLoading(false);
+                    return;
+                  }
                   await commissionService.createBankCommission({
-                    businessId: userData.businessId,
-                    branchId: userData.branchId,
+                    businessId,
+                    branchId,
                     ...bankCommissionForm,
                     recordedBy: userData.userId,
                     recordedByName: userData.name || userData.email,
@@ -1169,9 +1270,15 @@ export default function Transactions() {
                 e.preventDefault();
                 setLoading(true);
                 try {
+                  const { businessId, branchId } = getBusinessAndBranchIds();
+                  if (!businessId || !branchId) {
+                    alert("Error: Business ID or Branch ID is missing.");
+                    setLoading(false);
+                    return;
+                  }
                   await commissionService.createMoMoCommission({
-                    businessId: userData.businessId,
-                    branchId: userData.branchId,
+                    businessId,
+                    branchId,
                     ...momoCommissionForm,
                     recordedBy: userData.userId,
                     recordedByName: userData.name || userData.email,
@@ -1349,9 +1456,15 @@ export default function Transactions() {
                 setLoading(true);
                 try {
                   const totalAmount = parseFloat(simSaleForm.quantity || 0) * parseFloat(simSaleForm.unitPrice || 0);
+                  const { businessId, branchId } = getBusinessAndBranchIds();
+                  if (!businessId || !branchId) {
+                    alert("Error: Business ID or Branch ID is missing.");
+                    setLoading(false);
+                    return;
+                  }
                   await simSaleService.create({
-                    businessId: userData.businessId,
-                    branchId: userData.branchId,
+                    businessId,
+                    branchId,
                     ...simSaleForm,
                     totalAmount: totalAmount || simSaleForm.totalAmount,
                     recordedBy: userData.userId,
@@ -1577,9 +1690,15 @@ export default function Transactions() {
                 e.preventDefault();
                 setLoading(true);
                 try {
+                  const { businessId, branchId } = getBusinessAndBranchIds();
+                  if (!businessId || !branchId) {
+                    alert("Error: Business ID or Branch ID is missing.");
+                    setLoading(false);
+                    return;
+                  }
                   await expenseService.create({
-                    businessId: userData.businessId,
-                    branchId: userData.branchId,
+                    businessId,
+                    branchId,
                     ...expenseForm,
                     recordedBy: userData.userId,
                     recordedByName: userData.name || userData.email,
@@ -1809,9 +1928,15 @@ export default function Transactions() {
                     parseFloat(generalCommissionForm.firstBankCommission || 0) +
                     parseFloat(generalCommissionForm.gcbCommission || 0);
 
+                  const { businessId, branchId } = getBusinessAndBranchIds();
+                  if (!businessId || !branchId) {
+                    alert("Error: Business ID or Branch ID is missing.");
+                    setLoading(false);
+                    return;
+                  }
                   await generalDailyCommissionService.create({
-                    businessId: userData.businessId,
-                    branchId: userData.branchId,
+                    businessId,
+                    branchId,
                     ...generalCommissionForm,
                     totalBalance: total || generalCommissionForm.totalBalance,
                     recordedBy: userData.userId,
