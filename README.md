@@ -1,70 +1,81 @@
-# Getting Started with Create React App
+# MoMo Agency Management System
 
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+A comprehensive multi-tenant RBAC system for managing mobile money agent businesses in Ghana. The system manages multiple agent businesses, their branches, daily float operations, commissions, and transactions.
 
-## Available Scripts
+## Features
 
-In the project directory, you can run:
+- **Multi-Tenant Architecture**: Support for multiple agent businesses
+- **Role-Based Access Control**: IT Admin, Branch Manager, and Agent User roles
+- **Mobile Money Operations**: MTN, Vodafone, AirtelTigo, Telecel support
+- **Banking Services**: Ecobank, Fidelity, First Bank, GCB integration
+- **Float Management**: Daily opening and closing float tracking
+- **Reconciliation**: System vs actual balance reconciliation
+- **Transaction Recording**: Comprehensive transaction management
+- **Commission Tracking**: Automated commission calculations
+- **Reporting**: Daily, weekly, monthly, and custom reports
+- **Activity Logging**: Complete audit trail
 
-### `npm start`
+## Tech Stack
 
-Runs the app in the development mode.\
-Open [http://localhost:3000](http://localhost:3000) to view it in your browser.
+- React.js
+- Firebase (Firestore, Authentication)
+- Tailwind CSS
+- shadcn/ui components
+- React Router
+- Recharts for data visualization
 
-The page will reload when you make changes.\
-You may also see any lint errors in the console.
+## Setup
 
-### `npm test`
+1. Install dependencies:
+```bash
+npm install
+```
 
-Launches the test runner in the interactive watch mode.\
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+2. Configure Firebase:
+   - Copy `.env.example` to `.env`
+   - Add your Firebase configuration values
 
-### `npm run build`
+3. Start development server:
+```bash
+npm start
+```
 
-Builds the app for production to the `build` folder.\
-It correctly bundles React in production mode and optimizes the build for the best performance.
+## Project Structure
 
-The build is minified and the filenames include the hashes.\
-Your app is ready to be deployed!
+```
+src/
+├── components/
+│   ├── ui/          # Reusable UI components
+│   └── layout/      # Layout components (Sidebar, Layout)
+├── pages/           # Page components
+├── services/        # Firestore service layer
+├── context/         # React context (Auth)
+├── hooks/           # Custom hooks
+├── utils/           # Utility functions
+└── lib/             # Third-party library configs
+```
 
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+## User Roles
 
-### `npm run eject`
+- **IT Admin**: Full system access, can manage businesses, users, and branches
+- **Branch Manager**: Can manage users and branches within their business
+- **Agent User**: Can record transactions, manage float, and view reports
 
-**Note: this is a one-way operation. Once you `eject`, you can't go back!**
+## Collections
 
-If you aren't satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+The system uses the following Firestore collections:
+- agent_businesses
+- branches
+- users
+- daily_float
+- daily_reconciliation
+- momo_transactions
+- bank_transactions
+- commissions_tracking
+- expense_petty_cash
+- sim_sales
+- And more...
 
-Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you're on your own.
+## License
 
-You don't have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn't feel obligated to use this feature. However we understand that this tool wouldn't be useful if you couldn't customize it when you are ready for it.
-
-## Learn More
-
-You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
-
-To learn React, check out the [React documentation](https://reactjs.org/).
-
-### Code Splitting
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/code-splitting](https://facebook.github.io/create-react-app/docs/code-splitting)
-
-### Analyzing the Bundle Size
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size](https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size)
-
-### Making a Progressive Web App
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app](https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app)
-
-### Advanced Configuration
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/advanced-configuration](https://facebook.github.io/create-react-app/docs/advanced-configuration)
-
-### Deployment
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/deployment](https://facebook.github.io/create-react-app/docs/deployment)
-
-### `npm run build` fails to minify
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify](https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify)
+MIT
