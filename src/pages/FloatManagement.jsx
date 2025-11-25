@@ -9,6 +9,7 @@ import { Label } from "../components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Badge } from "../components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
+import { Select } from "../components/ui/select";
 import { AlertCircle, CheckCircle, XCircle, Plus } from "lucide-react";
 
 export default function FloatManagement() {
@@ -30,6 +31,7 @@ export default function FloatManagement() {
   const [merchantSims, setMerchantSims] = useState([]);
   const [showAddMerchantSim, setShowAddMerchantSim] = useState({ provider: "", visible: false });
   const [newMerchantSim, setNewMerchantSim] = useState({ provider: "", simName: "", agentNumber: "" });
+  const [banks] = useState(["Ecobank", "Fidelity", "First Bank", "GCB", "Others"]);
   const [formData, setFormData] = useState({
     date: new Date().toISOString().split("T")[0],
     time: new Date().toLocaleTimeString(),
@@ -52,11 +54,8 @@ export default function FloatManagement() {
     closingMerchantSimEcash: {},
     variance: "",
     varianceReason: "",
-    cashBanked: "",
-    bankName: "",
-    tellerName: "",
-    depositSlipNumber: "",
-    bankingTime: "",
+    // Store bank transactions as array: [{ bankName, transactionType, amount }, ...]
+    cashBanked: [],
     ecashSentToHQ: "",
     ecashSentToBranch: "",
     ecashRecipient: "",
@@ -157,21 +156,21 @@ export default function FloatManagement() {
       let telecelEcash = parseFloat(todayFloat?.openingTelecelEcash || 0);
 
       if (transactions.momo && Array.isArray(transactions.momo)) {
-        transactions.momo.forEach((t) => {
-          const amount = parseFloat(t.amount || 0);
+      transactions.momo.forEach((t) => {
+        const amount = parseFloat(t.amount || 0);
           // Cash In: Customer gives physical cash → Agent credits customer E-Cash
           // Physical Cash increases, E-Cash decreases
-          if (t.transactionType === "cash_in") {
+        if (t.transactionType === "cash_in") {
             physicalCash += amount; // Agent receives physical cash
             // If transaction has merchant SIM, update that specific SIM balance
             if (t.merchantSimId && merchantSimBalances.hasOwnProperty(t.merchantSimId)) {
               merchantSimBalances[t.merchantSimId] -= amount;
             } else {
               // Fallback to provider-level tracking
-              if (t.provider === "MTN") mtnEcash -= amount;
-              else if (t.provider === "Vodafone") vodafoneEcash -= amount;
-              else if (t.provider === "AirtelTigo") airtelTigoEcash -= amount;
-              else if (t.provider === "Telecel") telecelEcash -= amount;
+          if (t.provider === "MTN") mtnEcash -= amount;
+          else if (t.provider === "Vodafone") vodafoneEcash -= amount;
+          else if (t.provider === "AirtelTigo") airtelTigoEcash -= amount;
+          else if (t.provider === "Telecel") telecelEcash -= amount;
             }
           } 
           // Cash Out: Customer receives physical cash → Customer credits agent E-Cash
@@ -230,7 +229,7 @@ export default function FloatManagement() {
         // Set mode based on whether float is closed
         if (!float.closingPhysicalCash || float.closingPhysicalCash === "") {
           setMode("closing");
-        } else {
+      } else {
           setMode("view");
         }
       } else {
@@ -242,7 +241,7 @@ export default function FloatManagement() {
           setTodayFloat((currentFloat) => {
             // Only reset to opening if there's no float in state
             if (!currentFloat) {
-              setMode("opening");
+        setMode("opening");
             }
             return currentFloat;
           });
@@ -300,6 +299,24 @@ export default function FloatManagement() {
       alert("Please select a business and branch first!");
       return;
     }
+    
+    // Check if there's an unclosed float (any float with status "pending" or "flagged")
+    const unclosedFloat = floatHistory.find(f => {
+      const status = f.status || "pending";
+      return status === "pending" || status === "flagged";
+    });
+    
+    if (unclosedFloat) {
+      alert("Cannot create a new opening float. Please close the previous float first. There is an unclosed float that needs to be closed.");
+      return;
+    }
+    
+    // Also check todayFloat in state
+    if (todayFloat && (todayFloat.status === "pending" || todayFloat.status === "flagged")) {
+      alert("Cannot create a new opening float. Please close the current float first.");
+      return;
+    }
+    
     setLoading(true);
     isCreatingFloat.current = true;
     try {
@@ -354,12 +371,33 @@ export default function FloatManagement() {
   const handleApproveVariance = async () => {
     if (!todayFloat) return;
     
-    // Check if user has permission to approve (IT Admin cannot approve)
-    const canApprove = (userData?.role === "branch_manager" || userData?.role === "admin") &&
-                       userData?.branchId === branchId; // Only branch admin/manager for this branch
+    // Check if user has permission to approve
+    // Admin can approve for all branches in their assigned company
+    // Branch Manager can only approve for their assigned branch
+    // IT Admin cannot approve
+    const isAdmin = userData?.role === "admin";
+    const isBranchManager = userData?.role === "branch_manager";
+    const isITAdmin = userData?.role === "it_admin";
     
-    if (!canApprove) {
-      alert("You don't have permission to approve variances. Only branch admin or manager can approve.");
+    if (isITAdmin) {
+      alert("IT Admin cannot approve variances.");
+      return;
+    }
+    
+    if (!isAdmin && !isBranchManager) {
+      alert("You don't have permission to approve variances. Only admin or branch manager can approve.");
+      return;
+    }
+    
+    // Branch manager can only approve for their branch
+    if (isBranchManager && userData?.branchId !== branchId) {
+      alert("Branch managers can only approve variances for their assigned branch.");
+      return;
+    }
+    
+    // Admin can approve for any branch in their company
+    if (isAdmin && todayFloat.businessId !== businessId) {
+      alert("You can only approve variances for branches in your assigned company.");
       return;
     }
 
@@ -389,12 +427,33 @@ export default function FloatManagement() {
   };
 
   const handleApproveVarianceFromHistory = async (float) => {
-    // Check if user has permission to approve (IT Admin cannot approve)
-    const canApprove = (userData?.role === "branch_manager" || userData?.role === "admin") &&
-                       userData?.branchId === float.branchId; // Only branch admin/manager for this branch
+    // Check if user has permission to approve
+    // Admin can approve for all branches in their assigned company
+    // Branch Manager can only approve for their assigned branch
+    // IT Admin cannot approve
+    const isAdmin = userData?.role === "admin";
+    const isBranchManager = userData?.role === "branch_manager";
+    const isITAdmin = userData?.role === "it_admin";
     
-    if (!canApprove) {
-      alert("You don't have permission to approve variances. Only branch admin or manager can approve.");
+    if (isITAdmin) {
+      alert("IT Admin cannot approve variances.");
+      return;
+    }
+    
+    if (!isAdmin && !isBranchManager) {
+      alert("You don't have permission to approve variances. Only admin or branch manager can approve.");
+      return;
+    }
+    
+    // Branch manager can only approve for their branch
+    if (isBranchManager && userData?.branchId !== float.branchId) {
+      alert("Branch managers can only approve variances for their assigned branch.");
+      return;
+    }
+    
+    // Admin can approve for any branch in their company
+    if (isAdmin && float.businessId !== businessId) {
+      alert("You can only approve variances for branches in your assigned company.");
       return;
     }
 
@@ -482,11 +541,7 @@ export default function FloatManagement() {
         closingTelecelEcash: "",
         variance: "",
         varianceReason: "",
-        cashBanked: "",
-        bankName: "",
-        tellerName: "",
-        depositSlipNumber: "",
-        bankingTime: "",
+        cashBanked: [],
         ecashSentToHQ: "",
         ecashSentToBranch: "",
         ecashRecipient: "",
@@ -605,7 +660,7 @@ export default function FloatManagement() {
                           >
                             <Plus className="h-4 w-4 mr-1" /> Add {provider} SIM
                           </Button>
-                        </div>
+                  </div>
                         {providerSims.length === 0 ? (
                           <p className="text-sm text-muted-foreground">No {provider} merchant SIMs added yet. Click "+" to add.</p>
                         ) : (
@@ -616,7 +671,7 @@ export default function FloatManagement() {
                               return (
                                 <div key={sim.merchantSimId} className="space-y-2">
                                   <Label htmlFor={fieldKey}>{sim.simName} E-Cash (GHS) *</Label>
-                                  <Input
+                    <Input
                                     id={fieldKey}
                                     type="text"
                                     inputMode="decimal"
@@ -638,21 +693,21 @@ export default function FloatManagement() {
                                         setFormData({ ...formData, openingMerchantSimEcash: updated });
                                       }
                                     }}
-                                    required
-                                  />
-                                </div>
+                      required
+                    />
+                  </div>
                               );
                             })}
                           </div>
                         )}
                         {showAddMerchantSim.visible && showAddMerchantSim.provider === provider && (
                           <div className="p-3 border rounded-md bg-muted space-y-2">
-                            <Input
+                    <Input
                               placeholder={`${provider} SIM Name (e.g., ${provider}33)`}
                               value={newMerchantSim.simName}
                               onChange={(e) => setNewMerchantSim({ ...newMerchantSim, simName: e.target.value })}
                             />
-                            <Input
+                    <Input
                               placeholder="Agent Number (optional)"
                               value={newMerchantSim.agentNumber}
                               onChange={(e) => setNewMerchantSim({ ...newMerchantSim, agentNumber: e.target.value })}
@@ -672,7 +727,7 @@ export default function FloatManagement() {
                               >
                                 Cancel
                               </Button>
-                            </div>
+                  </div>
                           </div>
                         )}
                       </div>
@@ -790,7 +845,7 @@ export default function FloatManagement() {
                           >
                             <Plus className="h-4 w-4 mr-1" /> Add {provider} SIM
                           </Button>
-                        </div>
+                  </div>
                         {providerSims.length === 0 ? (
                           <p className="text-sm text-muted-foreground">No {provider} merchant SIMs added yet. Click "+" to add.</p>
                         ) : (
@@ -803,7 +858,7 @@ export default function FloatManagement() {
                               return (
                                 <div key={sim.merchantSimId} className="space-y-2">
                                   <Label htmlFor={fieldKey}>{sim.simName} E-Cash Balance (GHS) *</Label>
-                                  <Input
+                    <Input
                                     id={fieldKey}
                                     type="text"
                                     inputMode="decimal"
@@ -825,26 +880,26 @@ export default function FloatManagement() {
                                         setFormData({ ...formData, closingMerchantSimEcash: updated });
                                       }
                                     }}
-                                    required
-                                  />
+                      required
+                    />
                                   {expectedValue > 0 && (
-                                    <p className="text-sm text-muted-foreground">
+                      <p className="text-sm text-muted-foreground">
                                       Expected: GHS {expectedValue.toFixed(2)}
-                                    </p>
-                                  )}
-                                </div>
+                      </p>
+                    )}
+                  </div>
                               );
                             })}
                           </div>
                         )}
                         {showAddMerchantSim.visible && showAddMerchantSim.provider === provider && (
                           <div className="p-3 border rounded-md bg-muted space-y-2">
-                            <Input
+                    <Input
                               placeholder={`${provider} SIM Name (e.g., ${provider}33)`}
                               value={newMerchantSim.simName}
                               onChange={(e) => setNewMerchantSim({ ...newMerchantSim, simName: e.target.value })}
                             />
-                            <Input
+                    <Input
                               placeholder="Agent Number (optional)"
                               value={newMerchantSim.agentNumber}
                               onChange={(e) => setNewMerchantSim({ ...newMerchantSim, agentNumber: e.target.value })}
@@ -866,8 +921,8 @@ export default function FloatManagement() {
                               </Button>
                             </div>
                           </div>
-                        )}
-                      </div>
+                    )}
+                  </div>
                     );
                   })}
                 </div>
@@ -919,52 +974,96 @@ export default function FloatManagement() {
 
               <div className="border-t pt-4">
                 <h3 className="text-lg font-semibold mb-4">Cash Banking</h3>
-                <div className="grid gap-4 md:grid-cols-2">
-                  <div className="space-y-2">
-                    <Label htmlFor="cashBanked">Amount Banked (GHS)</Label>
-                    <Input
-                      id="cashBanked"
-                      type="number"
-                      step="0.01"
-                      value={formData.cashBanked}
-                      onChange={(e) => setFormData({ ...formData, cashBanked: e.target.value })}
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="bankName">Bank Name</Label>
-                    <Input
-                      id="bankName"
-                      value={formData.bankName}
-                      onChange={(e) => setFormData({ ...formData, bankName: e.target.value })}
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="tellerName">Teller Name</Label>
-                    <Input
-                      id="tellerName"
-                      value={formData.tellerName}
-                      onChange={(e) => setFormData({ ...formData, tellerName: e.target.value })}
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="depositSlipNumber">Deposit Slip Number</Label>
-                    <Input
-                      id="depositSlipNumber"
-                      value={formData.depositSlipNumber}
-                      onChange={(e) =>
-                        setFormData({ ...formData, depositSlipNumber: e.target.value })
-                      }
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="bankingTime">Time of Banking</Label>
-                    <Input
-                      id="bankingTime"
-                      type="time"
-                      value={formData.bankingTime}
-                      onChange={(e) => setFormData({ ...formData, bankingTime: e.target.value })}
-                    />
-                  </div>
+                <div className="space-y-4">
+                  {formData.cashBanked && formData.cashBanked.length > 0 && (
+                    <div className="space-y-3">
+                      {formData.cashBanked.map((transaction, index) => (
+                        <div key={index} className="border rounded-md p-4 bg-muted/50">
+                          <div className="grid gap-4 md:grid-cols-4 items-end">
+                            <div className="space-y-2">
+                              <Label>Bank Name</Label>
+                              <Select
+                                value={transaction.bankName || ""}
+                                onChange={(e) => {
+                                  const updated = [...formData.cashBanked];
+                                  updated[index] = { ...updated[index], bankName: e.target.value, transactionType: "", amount: "" };
+                                  setFormData({ ...formData, cashBanked: updated });
+                                }}
+                              >
+                                <option value="">Select Bank</option>
+                                {banks.map((bank) => (
+                                  <option key={bank} value={bank}>
+                                    {bank}
+                                  </option>
+                                ))}
+                              </Select>
+                            </div>
+                            {transaction.bankName && (
+                              <div className="space-y-2">
+                                <Label>Transaction Type</Label>
+                                <Select
+                                  value={transaction.transactionType || ""}
+                                  onChange={(e) => {
+                                    const updated = [...formData.cashBanked];
+                                    updated[index] = { ...updated[index], transactionType: e.target.value, amount: "" };
+                                    setFormData({ ...formData, cashBanked: updated });
+                                  }}
+                                >
+                                  <option value="">Select Type</option>
+                                  <option value="deposit">Deposit</option>
+                                  <option value="withdrawal">Withdrawal</option>
+                                </Select>
+                              </div>
+                            )}
+                            {transaction.bankName && transaction.transactionType && (
+                              <div className="space-y-2">
+                                <Label>Amount (GHS)</Label>
+                                <Input
+                                  type="number"
+                                  step="0.01"
+                                  value={transaction.amount || ""}
+                                  onChange={(e) => {
+                                    const updated = [...formData.cashBanked];
+                                    updated[index] = { ...updated[index], amount: e.target.value };
+                                    setFormData({ ...formData, cashBanked: updated });
+                                  }}
+                                  placeholder="Enter amount"
+                                />
+                              </div>
+                            )}
+                            <div className="flex items-end">
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => {
+                                  const updated = formData.cashBanked.filter((_, i) => i !== index);
+                                  setFormData({ ...formData, cashBanked: updated });
+                                }}
+                                className="text-red-600 hover:text-red-700"
+                              >
+                                Remove
+                              </Button>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setFormData({
+                        ...formData,
+                        cashBanked: [...(formData.cashBanked || []), { bankName: "", transactionType: "", amount: "" }],
+                      });
+                    }}
+                  >
+                    <Plus className="h-4 w-4 mr-2" />
+                    Add Bank Transaction
+                  </Button>
                 </div>
               </div>
 

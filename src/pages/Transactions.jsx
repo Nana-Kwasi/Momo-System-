@@ -211,6 +211,49 @@ export default function Transactions() {
     return providerMap[provider] || 0;
   };
 
+  // Calculate cash out charges based on amount
+  // 0-3000: free
+  // 3500-7000: 10 cedis
+  // 7000-11000: 20 cedis
+  // Above 15000: 50 cedis
+  const calculateCashOutCharges = (amount) => {
+    const amt = parseFloat(amount || 0);
+    if (amt <= 3000) return 0;
+    if (amt >= 3500 && amt < 7000) return 10;
+    if (amt >= 7000 && amt <= 11000) return 20;
+    if (amt >= 15000) return 50;
+    return 0; // For amounts between 3000-3500 and 11000-15000, default to 0
+  };
+
+  // Calculate cash in commission (1% of amount)
+  const calculateCashInCommission = (amount) => {
+    const amt = parseFloat(amount || 0);
+    return Math.round((amt * 0.01 + Number.EPSILON) * 100) / 100; // 1% rounded to 2 decimals
+  };
+
+  // Generate 4-digit random number
+  const generateFourDigits = () => {
+    return Math.floor(1000 + Math.random() * 9000).toString();
+  };
+
+  // Generate receipt number: merchant sim type + 4 digits
+  const generateReceiptNumber = (merchantSimName) => {
+    if (!merchantSimName) return "";
+    const simType = merchantSimName.replace(/\s+/g, "").toUpperCase(); // Remove spaces and uppercase
+    return `${simType}${generateFourDigits()}`;
+  };
+
+  // Generate transaction reference: merchant sim type + 4 digits (for MoMo) or bank name + 4 digits (for bank)
+  const generateTransactionReference = (merchantSimName, bankName = null) => {
+    if (bankName) {
+      const bank = bankName.replace(/\s+/g, "").toUpperCase();
+      return `${bank}${generateFourDigits()}`;
+    }
+    if (!merchantSimName) return "";
+    const simType = merchantSimName.replace(/\s+/g, "").toUpperCase();
+    return `${simType}${generateFourDigits()}`;
+  };
+
   const [momoForm, setMomoForm] = useState({
     date: new Date().toISOString().split("T")[0],
     time: new Date().toLocaleTimeString(),
@@ -233,6 +276,24 @@ export default function Transactions() {
     receiptNumber: "",
     remarks: "",
   });
+
+  // Initialize bank form with auto-generated transaction reference
+  const [bankForm, setBankForm] = useState(() => ({
+    date: new Date().toISOString().split("T")[0],
+    time: new Date().toLocaleTimeString(),
+    bankName: "Ecobank",
+    bankBranch: "",
+    transactionType: "deposit",
+    customerName: "",
+    customerNumber: "",
+    accountNumber: "",
+    accountName: "",
+    amount: "",
+    transactionReference: generateTransactionReference(null, "Ecobank"),
+    physicalCashBefore: "",
+    physicalCashAfter: "",
+    remarks: "",
+  }));
 
   const handleMoMoSubmit = async (e) => {
     e.preventDefault();
@@ -274,7 +335,7 @@ export default function Transactions() {
         businessId,
         branchId,
         ...momoForm,
-        agentNumber: momoForm.agentNumber || getAgentNumber(momoForm.provider),
+        agentNumber: getAgentNumber(momoForm.provider),
         physicalCashBefore: physicalBefore,
         physicalCashAfter: physicalAfter,
         ecashBefore: ecashBefore,
@@ -296,7 +357,6 @@ export default function Transactions() {
         amount: "",
         charges: "",
         commissionEarned: "",
-        agentNumber: "",
         physicalCashBefore: "",
         physicalCashAfter: "",
         ecashBefore: "",
@@ -305,6 +365,8 @@ export default function Transactions() {
         receiptNumber: "",
         remarks: "",
       });
+      // Reload balances after transaction
+      loadCurrentBalances();
       loadCurrentBalances();
       setActiveForm(null);
     } catch (error) {
@@ -313,25 +375,6 @@ export default function Transactions() {
       setLoading(false);
     }
   };
-
-  const [bankForm, setBankForm] = useState({
-    date: new Date().toISOString().split("T")[0],
-    time: new Date().toLocaleTimeString(),
-    bankName: "Ecobank",
-    transactionType: "deposit",
-    customerName: "",
-    customerNumber: "",
-    accountNumber: "",
-    accountName: "",
-    amount: "",
-    bankCharges: "",
-    agentCommission: "",
-    agentNumber: "",
-    transactionReference: "",
-    physicalCashBefore: "",
-    physicalCashAfter: "",
-    remarks: "",
-  });
 
   const [bankCommissionForm, setBankCommissionForm] = useState({
     date: new Date().toISOString().split("T")[0],
@@ -460,7 +503,8 @@ export default function Transactions() {
                     id="date"
                     type="date"
                     value={momoForm.date}
-                    onChange={(e) => setMomoForm({ ...momoForm, date: e.target.value })}
+                    readOnly
+                    disabled
                     required
                   />
                 </div>
@@ -470,7 +514,8 @@ export default function Transactions() {
                     id="time"
                     type="time"
                     value={momoForm.time}
-                    onChange={(e) => setMomoForm({ ...momoForm, time: e.target.value })}
+                    readOnly
+                    disabled
                     required
                   />
                 </div>
@@ -482,9 +527,26 @@ export default function Transactions() {
                   <Select
                     id="transactionType"
                     value={momoForm.transactionType}
-                    onChange={(e) =>
-                      setMomoForm({ ...momoForm, transactionType: e.target.value })
-                    }
+                    onChange={(e) => {
+                      const transactionType = e.target.value;
+                      let charges = "";
+                      let commission = "";
+                      
+                      // Recalculate charges/commission when transaction type changes
+                      if (transactionType === "cash_out") {
+                        charges = calculateCashOutCharges(momoForm.amount).toString();
+                      } else if (transactionType === "cash_in") {
+                        commission = calculateCashInCommission(momoForm.amount).toString();
+                        charges = commission;
+                      }
+                      
+                      setMomoForm({ 
+                        ...momoForm, 
+                        transactionType,
+                        charges,
+                        commissionEarned: commission
+                      });
+                    }}
                     required
                   >
                       <option value="cash_in">Cash-In</option>
@@ -528,12 +590,16 @@ export default function Transactions() {
                           value={momoForm.merchantSimId}
                           onChange={(e) => {
                             const selectedSim = merchantSims.find(s => (s.merchantSimId || s.id) === e.target.value);
+                            const simName = selectedSim?.simName || "";
                             setMomoForm({ 
                               ...momoForm, 
                               merchantSimId: e.target.value,
-                              merchantSimName: selectedSim?.simName || "",
+                              merchantSimName: simName,
                               // Reset ecashBefore so it recalculates with new merchant SIM
-                              ecashBefore: ""
+                              ecashBefore: "",
+                              // Auto-generate receipt number and transaction reference
+                              receiptNumber: generateReceiptNumber(simName),
+                              transactionReference: generateTransactionReference(simName)
                             });
                             // Reload balances to get latest merchant SIM balance
                             loadCurrentBalances();
@@ -652,7 +718,26 @@ export default function Transactions() {
                     type="number"
                     step="0.01"
                     value={momoForm.amount}
-                    onChange={(e) => setMomoForm({ ...momoForm, amount: e.target.value })}
+                    onChange={(e) => {
+                      const amount = e.target.value;
+                      let charges = "";
+                      let commission = "";
+                      
+                      // Auto-calculate based on transaction type
+                      if (momoForm.transactionType === "cash_out") {
+                        charges = calculateCashOutCharges(amount).toString();
+                      } else if (momoForm.transactionType === "cash_in") {
+                        commission = calculateCashInCommission(amount).toString();
+                        charges = commission; // For cash in, service charges = commission
+                      }
+                      
+                      setMomoForm({ 
+                        ...momoForm, 
+                        amount,
+                        charges,
+                        commissionEarned: commission
+                      });
+                    }}
                     required
                   />
                 </div>
@@ -663,7 +748,7 @@ export default function Transactions() {
                     type="number"
                     step="0.01"
                     value={momoForm.charges}
-                    onChange={(e) => setMomoForm({ ...momoForm, charges: e.target.value })}
+                    readOnly
                   />
                 </div>
               </div>
@@ -676,19 +761,7 @@ export default function Transactions() {
                     type="number"
                     step="0.01"
                     value={momoForm.commissionEarned}
-                    onChange={(e) =>
-                      setMomoForm({ ...momoForm, commissionEarned: e.target.value })
-                    }
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="agentNumber">Agent Number *</Label>
-                  <Input
-                    id="agentNumber"
-                    value={momoForm.agentNumber || getAgentNumber(momoForm.provider)}
-                    onChange={(e) => setMomoForm({ ...momoForm, agentNumber: e.target.value })}
-                    required
-                    placeholder="Agent number for this provider"
+                    readOnly
                   />
                 </div>
               </div>
@@ -761,9 +834,7 @@ export default function Transactions() {
                   <Input
                     id="transactionReference"
                     value={momoForm.transactionReference}
-                    onChange={(e) =>
-                      setMomoForm({ ...momoForm, transactionReference: e.target.value })
-                    }
+                    readOnly
                     required
                   />
                 </div>
@@ -772,7 +843,7 @@ export default function Transactions() {
                   <Input
                     id="receiptNumber"
                     value={momoForm.receiptNumber}
-                    onChange={(e) => setMomoForm({ ...momoForm, receiptNumber: e.target.value })}
+                    readOnly
                   />
                 </div>
               </div>
@@ -840,20 +911,19 @@ export default function Transactions() {
                     date: new Date().toISOString().split("T")[0],
                     time: new Date().toLocaleTimeString(),
                     bankName: "Ecobank",
+                    bankBranch: "",
                     transactionType: "deposit",
                     customerName: "",
                     customerNumber: "",
                     accountNumber: "",
                     accountName: "",
                     amount: "",
-                    bankCharges: "",
-                    agentCommission: "",
-                    agentNumber: "",
-                    transactionReference: "",
+                    transactionReference: generateTransactionReference(null, "Ecobank"),
                     physicalCashBefore: "",
                     physicalCashAfter: "",
                     remarks: "",
                   });
+                  loadCurrentBalances();
                   loadCurrentBalances();
                   setActiveForm(null);
                 } catch (error) {
@@ -871,7 +941,8 @@ export default function Transactions() {
                     id="bankDate"
                     type="date"
                     value={bankForm.date}
-                    onChange={(e) => setBankForm({ ...bankForm, date: e.target.value })}
+                    readOnly
+                    disabled
                     required
                   />
                 </div>
@@ -881,7 +952,8 @@ export default function Transactions() {
                     id="bankTime"
                     type="time"
                     value={bankForm.time}
-                    onChange={(e) => setBankForm({ ...bankForm, time: e.target.value })}
+                    readOnly
+                    disabled
                     required
                   />
                 </div>
@@ -893,7 +965,15 @@ export default function Transactions() {
                   <Select
                     id="bankName"
                     value={bankForm.bankName}
-                    onChange={(e) => setBankForm({ ...bankForm, bankName: e.target.value })}
+                    onChange={(e) => {
+                      const bankName = e.target.value;
+                      setBankForm({ 
+                        ...bankForm, 
+                        bankName,
+                        // Auto-generate transaction reference when bank name changes
+                        transactionReference: generateTransactionReference(null, bankName)
+                      });
+                    }}
                     required
                   >
                     <option value="Ecobank">Ecobank</option>
@@ -902,6 +982,16 @@ export default function Transactions() {
                     <option value="GCB">GCB</option>
                     <option value="Others">Others</option>
                   </Select>
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="bankBranch">Bank Branch *</Label>
+                  <Input
+                    id="bankBranch"
+                    value={bankForm.bankBranch}
+                    onChange={(e) => setBankForm({ ...bankForm, bankBranch: e.target.value })}
+                    required
+                    placeholder="Enter bank branch"
+                  />
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="bankTransactionType">Transaction Type *</Label>
@@ -962,50 +1052,16 @@ export default function Transactions() {
                 </div>
               </div>
 
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="bankAmount">Amount (GHS) *</Label>
-                  <Input
-                    id="bankAmount"
-                    type="number"
-                    step="0.01"
-                    value={bankForm.amount}
-                    onChange={(e) => setBankForm({ ...bankForm, amount: e.target.value })}
-                    required
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="bankCharges">Bank Charges (GHS)</Label>
-                  <Input
-                    id="bankCharges"
-                    type="number"
-                    step="0.01"
-                    value={bankForm.bankCharges}
-                    onChange={(e) => setBankForm({ ...bankForm, bankCharges: e.target.value })}
-                  />
-                </div>
-              </div>
-
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="bankAgentCommission">Agent Commission (GHS)</Label>
-                  <Input
-                    id="bankAgentCommission"
-                    type="number"
-                    step="0.01"
-                    value={bankForm.agentCommission}
-                    onChange={(e) => setBankForm({ ...bankForm, agentCommission: e.target.value })}
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="bankAgentNumber">Agent Number *</Label>
-                  <Input
-                    id="bankAgentNumber"
-                    value={bankForm.agentNumber}
-                    onChange={(e) => setBankForm({ ...bankForm, agentNumber: e.target.value })}
-                    required
-                  />
-                </div>
+              <div className="space-y-2">
+                <Label htmlFor="bankAmount">Amount (GHS) *</Label>
+                <Input
+                  id="bankAmount"
+                  type="number"
+                  step="0.01"
+                  value={bankForm.amount}
+                  onChange={(e) => setBankForm({ ...bankForm, amount: e.target.value })}
+                  required
+                />
               </div>
 
               <div className="grid gap-4 md:grid-cols-2">
@@ -1014,7 +1070,7 @@ export default function Transactions() {
                   <Input
                     id="bankTransactionReference"
                     value={bankForm.transactionReference}
-                    onChange={(e) => setBankForm({ ...bankForm, transactionReference: e.target.value })}
+                    readOnly
                     required
                   />
                 </div>

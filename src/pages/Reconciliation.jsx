@@ -53,7 +53,7 @@ export default function Reconciliation() {
       loadSystemBalances(); // This will set loading to true internally
       // Auto-refresh every 1 minute to get latest transactions
       const interval = setInterval(() => {
-        loadSystemBalances();
+      loadSystemBalances();
       }, 60000); // 60 seconds (1 minute)
       return () => clearInterval(interval);
     }
@@ -152,7 +152,7 @@ export default function Reconciliation() {
       try {
         const floatPromise = dailyFloatService.getByBranchAndDate(branchId, todayDate);
         float = await Promise.race([floatPromise, timeoutPromise]);
-        if (float) {
+      if (float) {
           dataFound = true;
         }
       } catch (floatError) {
@@ -374,7 +374,8 @@ export default function Reconciliation() {
   };
 
   const calculateVariance = (system, actual) => {
-    return parseFloat(system || 0) - parseFloat(actual || 0);
+    // Return actual - system so positive means actual is more than system
+    return parseFloat(actual || 0) - parseFloat(system || 0);
   };
 
   // Check if all actual values are entered (including merchant SIMs)
@@ -599,10 +600,13 @@ export default function Reconciliation() {
                     }
                   >
                     GHS{" "}
-                    {calculateVariance(
+                    {(() => {
+                      const diff = calculateVariance(
                       formData.systemPhysicalCash,
                       formData.actualPhysicalCash
-                    ).toLocaleString()}
+                      );
+                      return diff >= 0 ? `+${diff.toLocaleString()}` : diff.toLocaleString();
+                    })()}
                   </span>
                 </p>
               </div>
@@ -699,7 +703,7 @@ export default function Reconciliation() {
                     <p className="text-sm">
                       Difference:{" "}
                                     <span className={Math.abs(variance) > 0.02 ? "text-red-600 font-bold" : "text-green-600"}>
-                                      GHS {variance.toLocaleString()}
+                                      GHS {variance >= 0 ? `+${variance.toLocaleString()}` : variance.toLocaleString()}
                       </span>
                     </p>
                     </div>

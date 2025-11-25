@@ -1,6 +1,6 @@
 {
   "name": "momo-agency-system",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "private": true,
   "dependencies": {
     "@tanstack/react-query": "^5.90.10",
