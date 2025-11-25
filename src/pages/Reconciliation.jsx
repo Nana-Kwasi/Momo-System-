@@ -246,7 +246,7 @@ export default function Reconciliation() {
             return;
           }
           
-          console.log(`Processing transaction: ${t.transactionType} ${t.provider} ${t.merchantSimName || ''} GHS ${amount} | Date: ${t.date}`);
+          console.log(`Processing MoMo transaction: ${t.transactionType} ${t.provider} ${t.merchantSimName || ''} GHS ${amount} | Date: ${t.date}`);
           
           // Cash In: Customer gives physical cash → Agent credits customer E-Cash
           // Physical Cash increases, E-Cash decreases
@@ -277,6 +277,30 @@ export default function Reconciliation() {
               else if (t.provider === "AirtelTigo") airtelTigoEcash += amount;
               else if (t.provider === "Telecel") telecelEcash += amount;
             }
+          }
+        });
+      }
+      
+      // Process bank transactions
+      if (transactions?.bank && Array.isArray(transactions.bank)) {
+        transactions.bank.forEach((t) => {
+          const amount = parseFloat(t.amount || 0);
+          if (isNaN(amount) || amount <= 0) {
+            console.warn("Skipping invalid bank transaction:", t);
+            return;
+          }
+          
+          console.log(`Processing bank transaction: ${t.transactionType} ${t.bankName || ''} GHS ${amount} | Date: ${t.date}`);
+          
+          // Deposit: Customer deposits money into bank account → Agent receives physical cash
+          // Physical Cash increases
+          if (t.transactionType === "deposit") {
+            physicalCash += amount; // Agent receives physical cash
+          } 
+          // Withdrawal: Customer withdraws money from bank account → Agent gives physical cash
+          // Physical Cash decreases
+          else if (t.transactionType === "withdrawal") {
+            physicalCash -= amount; // Agent gives physical cash
           }
         });
       }

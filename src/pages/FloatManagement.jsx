@@ -72,9 +72,57 @@ export default function FloatManagement() {
       loadMerchantSims();
       loadTodayFloat();
       loadFloatHistory();
-      calculateExpectedBalances();
     }
   }, [branchId]);
+
+  // Calculate expected balances when todayFloat is loaded
+  useEffect(() => {
+    if (todayFloat && branchId) {
+      calculateExpectedBalances();
+    }
+  }, [todayFloat, branchId]);
+
+  // Auto-populate closing form with expected balances when mode changes to closing and expected balances are ready
+  useEffect(() => {
+    if (mode === "closing" && todayFloat && expectedBalances.physicalCash !== undefined && expectedBalances.physicalCash !== null) {
+      // Check if closing values are empty or invalid
+      const currentPhysicalCash = parseFloat(formData.closingPhysicalCash || 0);
+      const expectedPhysicalCash = parseFloat(expectedBalances.physicalCash || 0);
+      const hasValidClosingValues = formData.closingPhysicalCash && 
+                                    formData.closingPhysicalCash !== "" && 
+                                    formData.closingPhysicalCash !== "0.00" &&
+                                    !isNaN(currentPhysicalCash);
+      
+      // Auto-populate if values are empty or significantly different from expected (more than 1 cent difference)
+      // This ensures values always match reconciliation
+      if (!hasValidClosingValues || Math.abs(currentPhysicalCash - expectedPhysicalCash) > 0.01) {
+        const merchantSimEcash = {};
+        if (expectedBalances.merchantSimEcash && typeof expectedBalances.merchantSimEcash === 'object') {
+          Object.keys(expectedBalances.merchantSimEcash).forEach(simId => {
+            const expectedValue = expectedBalances.merchantSimEcash[simId];
+            if (expectedValue !== undefined && expectedValue !== null && !isNaN(expectedValue)) {
+              merchantSimEcash[simId] = parseFloat(expectedValue).toFixed(2);
+            }
+          });
+        }
+        
+        setFormData(prev => {
+          // Always update to match expected balances from reconciliation
+          const newData = {
+            ...prev,
+            closingPhysicalCash: expectedBalances.physicalCash.toFixed(2),
+            closingMerchantSimEcash: { ...prev.closingMerchantSimEcash, ...merchantSimEcash },
+          };
+          console.log("Auto-populating closing form:", {
+            physicalCash: newData.closingPhysicalCash,
+            merchantSimEcash: newData.closingMerchantSimEcash,
+            expectedBalances
+          });
+          return newData;
+        });
+      }
+    }
+  }, [mode, todayFloat, expectedBalances.physicalCash]);
 
   const loadMerchantSims = async () => {
     try {
@@ -127,7 +175,13 @@ export default function FloatManagement() {
     try {
       if (!branchId) return;
       const today = new Date();
-      const transactions = await transactionService.getTodayTransactions(branchId, userData?.userId, userData?.role);
+      // For float management, admins should see ALL branch transactions
+      const isAdmin = userData?.role === "admin" || userData?.role === "branch_manager" || userData?.role === "it_admin";
+      const transactions = await transactionService.getTodayTransactions(
+        branchId, 
+        isAdmin ? null : userData?.userId, 
+        isAdmin ? "admin" : userData?.role
+      );
       
       // Initialize merchant SIM balances from opening float
       const merchantSimBalances = {};
@@ -190,6 +244,28 @@ export default function FloatManagement() {
           }
         });
       }
+      
+      // Process bank transactions
+      if (transactions.bank && Array.isArray(transactions.bank)) {
+        transactions.bank.forEach((t) => {
+          const amount = parseFloat(t.amount || 0);
+          if (isNaN(amount) || amount <= 0) {
+            console.warn("Skipping invalid bank transaction:", t);
+            return;
+          }
+          
+          // Deposit: Customer deposits money into bank account → Agent receives physical cash
+          // Physical Cash increases
+          if (t.transactionType === "deposit") {
+            physicalCash += amount; // Agent receives physical cash
+          } 
+          // Withdrawal: Customer withdraws money from bank account → Agent gives physical cash
+          // Physical Cash decreases
+          else if (t.transactionType === "withdrawal") {
+            physicalCash -= amount; // Agent gives physical cash
+          }
+        });
+      }
 
       setExpectedBalances({
         physicalCash,
@@ -220,12 +296,27 @@ export default function FloatManagement() {
       if (float) {
         hasFloatInState.current = true;
         setTodayFloat(float);
-        setFormData((prev) => ({
-          ...prev,
-          ...float,
-          date: float.date?.toDate?.()?.toISOString().split("T")[0] || 
-                (typeof float.date === 'string' ? float.date : prev.date),
-        }));
+        // Only load closing values if they exist, otherwise let auto-population handle it
+        const hasClosingValues = float.closingPhysicalCash && float.closingPhysicalCash !== "";
+        setFormData((prev) => {
+          const newFormData = {
+            ...prev,
+            ...float,
+            date: float.date?.toDate?.()?.toISOString().split("T")[0] || 
+                  (typeof float.date === 'string' ? float.date : prev.date),
+          };
+          
+          // Only set closing values if they exist in the float, otherwise keep empty for auto-population
+          if (!hasClosingValues) {
+            newFormData.closingPhysicalCash = "";
+            newFormData.closingMerchantSimEcash = {};
+          } else {
+            newFormData.closingPhysicalCash = float.closingPhysicalCash || "";
+            newFormData.closingMerchantSimEcash = float.closingMerchantSimEcash || {};
+          }
+          
+          return newFormData;
+        });
         // Set mode based on whether float is closed
         if (!float.closingPhysicalCash || float.closingPhysicalCash === "") {
           setMode("closing");
@@ -275,10 +366,26 @@ export default function FloatManagement() {
   const calculateVariance = () => {
     if (!todayFloat) return { physicalCash: 0, mtn: 0, vodafone: 0, airtelTigo: 0, telecel: 0 };
     
+    // Only calculate variance if closing values are entered
     const closingPhysical = parseFloat(formData.closingPhysicalCash || 0);
+    if (!formData.closingPhysicalCash || formData.closingPhysicalCash === "") {
+      return { physicalCash: 0, mtn: 0, vodafone: 0, airtelTigo: 0, telecel: 0 };
+    }
+    
     const expectedPhysical = expectedBalances.physicalCash;
     const physicalVariance = closingPhysical - expectedPhysical;
 
+    // Calculate merchant SIM variances
+    const merchantSimVariances = {};
+    if (formData.closingMerchantSimEcash && expectedBalances.merchantSimEcash) {
+      Object.keys(expectedBalances.merchantSimEcash).forEach(simId => {
+        const closingValue = parseFloat(formData.closingMerchantSimEcash?.[simId] || 0);
+        const expectedValue = expectedBalances.merchantSimEcash[simId] || 0;
+        merchantSimVariances[simId] = closingValue - expectedValue;
+      });
+    }
+
+    // Fallback to provider-level if merchant SIM data not available
     const mtnVariance = parseFloat(formData.closingMtnEcash || 0) - expectedBalances.mtnEcash;
     const vodafoneVariance = parseFloat(formData.closingVodafoneEcash || 0) - expectedBalances.vodafoneEcash;
     const airtelTigoVariance = parseFloat(formData.closingAirtelTigoEcash || 0) - expectedBalances.airtelTigoEcash;
@@ -290,6 +397,7 @@ export default function FloatManagement() {
       vodafone: vodafoneVariance,
       airtelTigo: airtelTigoVariance,
       telecel: telecelVariance,
+      merchantSim: merchantSimVariances,
     };
   };
 
@@ -495,9 +603,10 @@ export default function FloatManagement() {
     try {
       const variances = calculateVariance();
       const totalVariance = Math.abs(variances.physicalCash);
-      const variancePercentage = todayFloat.openingPhysicalCash 
-        ? (totalVariance / parseFloat(todayFloat.openingPhysicalCash)) * 100 
-        : 0;
+      // Calculate variance percentage based on expected balance (after all transactions)
+      const variancePercentage = expectedBalances.physicalCash > 0
+        ? (totalVariance / expectedBalances.physicalCash) * 100
+        : (totalVariance > 0 ? 100 : 0); // If expected is 0 but there's variance, show 100%
 
       // Allow approval of any variance amount - all variances can be flagged for review
       const status = Math.abs(variancePercentage) > 0 ? "flagged" : "pending";
@@ -568,9 +677,14 @@ export default function FloatManagement() {
 
   const variances = calculateVariance();
   const totalVariance = Math.abs(variances.physicalCash);
-  const variancePercentage = todayFloat?.openingPhysicalCash 
-    ? (totalVariance / parseFloat(todayFloat.openingPhysicalCash)) * 100 
-    : 0;
+  
+  // Check if closing values have been entered
+  const hasClosingValues = formData.closingPhysicalCash && formData.closingPhysicalCash !== "";
+  
+  // Calculate variance percentage based on expected balance (after all transactions)
+  const variancePercentage = expectedBalances.physicalCash > 0
+    ? (totalVariance / expectedBalances.physicalCash) * 100
+    : (totalVariance > 0 ? 100 : 0); // If expected is 0 but there's variance, show 100%
 
   return (
     <div className="space-y-6">
@@ -810,7 +924,38 @@ export default function FloatManagement() {
                 <h3 className="text-lg font-semibold mb-4">Closing Balances</h3>
                 <div className="grid gap-4 md:grid-cols-2">
                   <div className="space-y-2">
+                    <div className="flex items-center justify-between">
                     <Label htmlFor="closingPhysicalCash">Physical Cash in Hand (GHS) *</Label>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={async () => {
+                          // Recalculate expected balances first to ensure latest values
+                          await calculateExpectedBalances();
+                          // Wait a bit for state to update
+                          setTimeout(() => {
+                            const merchantSimEcash = {};
+                            if (expectedBalances.merchantSimEcash && typeof expectedBalances.merchantSimEcash === 'object') {
+                              Object.keys(expectedBalances.merchantSimEcash).forEach(simId => {
+                                const expectedValue = expectedBalances.merchantSimEcash[simId];
+                                if (expectedValue !== undefined && expectedValue !== null && !isNaN(expectedValue)) {
+                                  merchantSimEcash[simId] = parseFloat(expectedValue).toFixed(2);
+                                }
+                              });
+                            }
+                            
+                            setFormData(prev => ({
+                              ...prev,
+                              closingPhysicalCash: expectedBalances.physicalCash.toFixed(2),
+                              closingMerchantSimEcash: { ...prev.closingMerchantSimEcash, ...merchantSimEcash },
+                            }));
+                          }, 100);
+                        }}
+                      >
+                        🔄 Sync with Reconciliation
+                      </Button>
+                    </div>
                     <Input
                       id="closingPhysicalCash"
                       type="number"
@@ -823,7 +968,7 @@ export default function FloatManagement() {
                     />
                     {expectedBalances.physicalCash > 0 && (
                       <p className="text-sm text-muted-foreground">
-                        Expected: GHS {expectedBalances.physicalCash.toFixed(2)}
+                        Expected (from Reconciliation): GHS {expectedBalances.physicalCash.toFixed(2)}
                       </p>
                     )}
                   </div>
@@ -883,8 +1028,8 @@ export default function FloatManagement() {
                       required
                     />
                                   {expectedValue > 0 && (
-                      <p className="text-sm text-muted-foreground">
-                                      Expected: GHS {expectedValue.toFixed(2)}
+                      <p className="text-xs text-muted-foreground">
+                                      Expected (from Reconciliation): GHS {expectedValue.toFixed(2)}
                       </p>
                     )}
                   </div>
@@ -928,34 +1073,68 @@ export default function FloatManagement() {
                 </div>
               </div>
 
-              {totalVariance > 0 && (
+              {hasClosingValues && (
                 <div className="border-t pt-4">
                   <h3 className="text-lg font-semibold mb-4">Variance Analysis</h3>
-                  <div className="space-y-2 p-4 bg-yellow-50 border border-yellow-200 rounded-md">
+                  <div className={`space-y-2 p-4 border rounded-md ${
+                    totalVariance === 0 
+                      ? "bg-green-50 border-green-200" 
+                      : variancePercentage > 2 
+                        ? "bg-red-50 border-red-200" 
+                        : "bg-yellow-50 border-yellow-200"
+                  }`}>
                     <div className="flex items-center gap-2">
-                      {variancePercentage > 2 ? (
-                        <XCircle className="h-5 w-5 text-red-600" />
-                      ) : variancePercentage > 0 ? (
-                        <AlertCircle className="h-5 w-5 text-yellow-600" />
-                      ) : (
+                      {totalVariance === 0 ? (
                         <CheckCircle className="h-5 w-5 text-green-600" />
+                      ) : variancePercentage > 2 ? (
+                        <XCircle className="h-5 w-5 text-red-600" />
+                      ) : (
+                        <AlertCircle className="h-5 w-5 text-yellow-600" />
                       )}
                       <span className="font-semibold">
-                        Physical Cash Variance: GHS {variances.physicalCash.toFixed(2)} (
+                        Physical Cash Variance: GHS {variances.physicalCash >= 0 ? `+${variances.physicalCash.toFixed(2)}` : variances.physicalCash.toFixed(2)} (
                         {variancePercentage.toFixed(2)}%)
                       </span>
                     </div>
-                    {variancePercentage > 2 && (
+                    {totalVariance === 0 && (
+                      <p className="text-sm text-green-600 font-semibold">
+                        ✅ Balanced - No variance detected
+                      </p>
+                    )}
+                    {totalVariance > 0 && variancePercentage > 2 && (
                       <p className="text-sm text-red-600 font-semibold">
                         ⚠️ Major variance detected! Manager approval required.
                       </p>
                     )}
+                    {totalVariance > 0 && variancePercentage <= 2 && (
+                      <p className="text-sm text-yellow-600 font-semibold">
+                        ⚠️ Minor variance detected
+                      </p>
+                    )}
+                    {/* Show merchant SIM variances if available */}
+                    {variances.merchantSim && Object.keys(variances.merchantSim).length > 0 && (
+                      <div className="space-y-1 text-sm mt-2">
+                        <p className="font-semibold">Merchant SIM Variances:</p>
+                        {Object.keys(variances.merchantSim).map(simId => {
+                          const sim = merchantSims.find(s => (s.merchantSimId || s.id) === simId);
+                          const simVariance = variances.merchantSim[simId];
+                          return (
+                            <p key={simId}>
+                              {sim?.simName || simId}: GHS {simVariance >= 0 ? `+${simVariance.toFixed(2)}` : simVariance.toFixed(2)}
+                            </p>
+                          );
+                        })}
+                      </div>
+                    )}
+                    {/* Fallback to provider-level if merchant SIM data not available */}
+                    {(!variances.merchantSim || Object.keys(variances.merchantSim).length === 0) && (
                     <div className="space-y-1 text-sm">
-                      <p>MTN Variance: GHS {variances.mtn.toFixed(2)}</p>
-                      <p>Vodafone Variance: GHS {variances.vodafone.toFixed(2)}</p>
-                      <p>AirtelTigo Variance: GHS {variances.airtelTigo.toFixed(2)}</p>
-                      <p>Telecel Variance: GHS {variances.telecel.toFixed(2)}</p>
+                        <p>MTN Variance: GHS {variances.mtn >= 0 ? `+${variances.mtn.toFixed(2)}` : variances.mtn.toFixed(2)}</p>
+                        <p>Vodafone Variance: GHS {variances.vodafone >= 0 ? `+${variances.vodafone.toFixed(2)}` : variances.vodafone.toFixed(2)}</p>
+                        <p>AirtelTigo Variance: GHS {variances.airtelTigo >= 0 ? `+${variances.airtelTigo.toFixed(2)}` : variances.airtelTigo.toFixed(2)}</p>
+                        <p>Telecel Variance: GHS {variances.telecel >= 0 ? `+${variances.telecel.toFixed(2)}` : variances.telecel.toFixed(2)}</p>
                     </div>
+                    )}
                   </div>
                   <div className="mt-4 space-y-2">
                     <Label htmlFor="varianceReason">Variance Reason *</Label>
@@ -980,7 +1159,7 @@ export default function FloatManagement() {
                       {formData.cashBanked.map((transaction, index) => (
                         <div key={index} className="border rounded-md p-4 bg-muted/50">
                           <div className="grid gap-4 md:grid-cols-4 items-end">
-                            <div className="space-y-2">
+                  <div className="space-y-2">
                               <Label>Bank Name</Label>
                               <Select
                                 value={transaction.bankName || ""}
@@ -997,9 +1176,9 @@ export default function FloatManagement() {
                                   </option>
                                 ))}
                               </Select>
-                            </div>
+                  </div>
                             {transaction.bankName && (
-                              <div className="space-y-2">
+                  <div className="space-y-2">
                                 <Label>Transaction Type</Label>
                                 <Select
                                   value={transaction.transactionType || ""}
@@ -1013,12 +1192,12 @@ export default function FloatManagement() {
                                   <option value="deposit">Deposit</option>
                                   <option value="withdrawal">Withdrawal</option>
                                 </Select>
-                              </div>
+                  </div>
                             )}
                             {transaction.bankName && transaction.transactionType && (
-                              <div className="space-y-2">
+                  <div className="space-y-2">
                                 <Label>Amount (GHS)</Label>
-                                <Input
+                    <Input
                                   type="number"
                                   step="0.01"
                                   value={transaction.amount || ""}
@@ -1028,8 +1207,8 @@ export default function FloatManagement() {
                                     setFormData({ ...formData, cashBanked: updated });
                                   }}
                                   placeholder="Enter amount"
-                                />
-                              </div>
+                    />
+                  </div>
                             )}
                             <div className="flex items-end">
                               <Button
@@ -1044,8 +1223,8 @@ export default function FloatManagement() {
                               >
                                 Remove
                               </Button>
-                            </div>
-                          </div>
+                  </div>
+                  </div>
                         </div>
                       ))}
                     </div>

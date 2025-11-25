@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { transactionService, commissionService, expenseService, simSaleService, generalDailyCommissionService, branchService, dailyFloatService } from "../services/firestoreService";
+import { transactionService, commissionService, expenseService, simSaleService, generalDailyCommissionService, branchService, dailyFloatService, disbursementService } from "../services/firestoreService";
 import { merchantSimService } from "../services/merchantSimService";
 import { useAuth } from "../context/AuthContext";
 import { Button } from "../components/ui/button";
@@ -27,18 +27,284 @@ export default function Transactions() {
   });
 
   useEffect(() => {
+    if (!userData) return; // Wait for userData to load
+    
     const branchId = selectedBranchId || userData?.branchId;
-    if (branchId) {
+    const businessId = selectedBusinessId || userData?.businessId;
+    
+    if (branchId && businessId) {
       loadBranchData();
       loadMerchantSims();
       loadCurrentBalances();
+      
+      // Refresh balances every 30 seconds to get latest values
+      const interval = setInterval(() => {
+        loadCurrentBalances();
+      }, 30000); // 30 seconds
+      
+      return () => clearInterval(interval);
     }
-  }, [userData?.branchId, selectedBranchId]);
+  }, [userData, userData?.branchId, userData?.businessId, selectedBranchId, selectedBusinessId]);
+
+  // Refresh balances when bank form is opened to show latest values
+  useEffect(() => {
+    if (activeForm === "bank") {
+      loadCurrentBalances();
+    }
+  }, [activeForm]);
+
+  const [expenseForm, setExpenseForm] = useState({
+    date: new Date().toISOString().split("T")[0],
+    expenseCategory: "transport",
+    description: "",
+    quantity: "",
+    unitPrice: "",
+    amountPaid: "",
+    amountReceived: "",
+    paymentMethod: "cash",
+    paidTo: "",
+    pettyCashBalance: "",
+    remarks: "",
+  });
+
+  // Categories that require quantity and unit price
+  const categoriesRequiringQuantity = ["stationery", "airtime", "other"];
+
+  // Load latest disbursement amount when expense form is opened
+  useEffect(() => {
+    const loadLatestDisbursement = async () => {
+      if (activeForm === "expense") {
+        const branchId = selectedBranchId || userData?.branchId;
+        if (!branchId) {
+          console.warn("Expenses: No branchId available");
+          return;
+        }
+
+        try {
+          console.log("Expenses: Loading latest disbursement for branch:", branchId);
+          const latestDisbursement = await disbursementService.getLatestByBranch(branchId);
+          console.log("Expenses: Latest disbursement:", latestDisbursement);
+          
+          if (latestDisbursement && latestDisbursement.amountReceived) {
+            const amountReceived = latestDisbursement.amountReceived;
+            console.log("Expenses: Setting amountReceived to:", amountReceived);
+            setExpenseForm(prev => ({
+              ...prev,
+              amountReceived: typeof amountReceived === 'number' ? amountReceived.toString() : amountReceived,
+            }));
+          } else {
+            console.warn("Expenses: No disbursement found or amountReceived is missing");
+            setExpenseForm(prev => ({
+              ...prev,
+              amountReceived: "",
+            }));
+          }
+        } catch (error) {
+          console.error("Error loading latest disbursement:", error);
+          setExpenseForm(prev => ({
+            ...prev,
+            amountReceived: "",
+          }));
+        }
+      }
+    };
+    loadLatestDisbursement();
+  }, [activeForm, selectedBranchId, userData?.branchId]);
+
+  // Auto-calculate petty cash balance when amount paid changes
+  useEffect(() => {
+    if (activeForm === "expense" && expenseForm.amountReceived && expenseForm.amountPaid) {
+      const received = parseFloat(expenseForm.amountReceived || 0);
+      const paid = parseFloat(expenseForm.amountPaid || 0);
+      const balance = received - paid;
+      setExpenseForm(prev => ({
+        ...prev,
+        pettyCashBalance: balance.toFixed(2),
+      }));
+    } else if (activeForm === "expense" && expenseForm.amountReceived && !expenseForm.amountPaid) {
+      // If no amount paid, balance equals amount received
+      setExpenseForm(prev => ({
+        ...prev,
+        pettyCashBalance: expenseForm.amountReceived,
+      }));
+    }
+  }, [activeForm, expenseForm.amountPaid, expenseForm.amountReceived]);
+
+  const [bankCommissionForm, setBankCommissionForm] = useState({
+    date: new Date().toISOString().split("T")[0],
+    bankName: "Ecobank",
+    commissionType: "All", // Default to "All" for non-Ecobank banks
+    numberOfTransactions: "",
+    totalTransactionValue: "",
+    commissionRate: "",
+    commissionAmount: "",
+    commissionReceived: false,
+    remarks: "",
+  });
+
+  const [momoCommissionForm, setMomoCommissionForm] = useState({
+    date: new Date().toISOString().split("T")[0],
+    provider: "",
+    merchantSimId: "",
+    merchantSimName: "",
+    commissionType: "",
+    numberOfTransactions: "",
+    totalTransactionValue: "",
+    commissionRate: "",
+    commissionEarned: "",
+    remarks: "",
+  });
+  
+  const [momoCommissions, setMomoCommissions] = useState([]); // Store multiple commissions
+
+  // Load bank transactions for commission form
+  const loadBankTransactionsForCommission = async (bankName, commissionType, date) => {
+    try {
+      const branchId = selectedBranchId || userData?.branchId;
+      if (!branchId) return { count: 0, total: 0 };
+      
+      const transactions = await transactionService.getTodayTransactions(
+        branchId,
+        null, // Admin view for commission calculation
+        "admin"
+      );
+      
+      if (!transactions?.bank || !Array.isArray(transactions.bank)) {
+        return { count: 0, total: 0 };
+      }
+      
+      // Filter by bank name and commission type (if not "All")
+      const filtered = transactions.bank.filter(t => {
+        const matchesBank = t.bankName === bankName;
+        const matchesType = commissionType === "All" || t.transactionType === commissionType;
+        // Check date match (handle both string and Timestamp)
+        const tDate = t.date?.toDate ? t.date.toDate().toISOString().split("T")[0] : (typeof t.date === 'string' ? t.date : new Date(t.date).toISOString().split("T")[0]);
+        const matchesDate = tDate === date;
+        return matchesBank && matchesType && matchesDate;
+      });
+      
+      const count = filtered.length;
+      const total = filtered.reduce((sum, t) => sum + parseFloat(t.amount || 0), 0);
+      
+      return { count, total };
+    } catch (error) {
+      console.error("Error loading bank transactions:", error);
+      return { count: 0, total: 0 };
+    }
+  };
+
+  // Auto-populate bank commission fields when bank/type/date changes
+  useEffect(() => {
+    if (activeForm === "bank_commission" && bankCommissionForm.bankName && bankCommissionForm.date) {
+      const loadData = async () => {
+        const { count, total } = await loadBankTransactionsForCommission(
+          bankCommissionForm.bankName,
+          bankCommissionForm.commissionType,
+          bankCommissionForm.date
+        );
+        setBankCommissionForm(prev => ({
+          ...prev,
+          numberOfTransactions: count.toString(),
+          totalTransactionValue: total.toFixed(2),
+        }));
+      };
+      loadData();
+    }
+  }, [activeForm, bankCommissionForm.bankName, bankCommissionForm.commissionType, bankCommissionForm.date]);
+
+  // Auto-calculate commission rate from commission amount
+  useEffect(() => {
+    if (activeForm === "bank_commission" && bankCommissionForm.commissionAmount && bankCommissionForm.totalTransactionValue) {
+      const commissionAmount = parseFloat(bankCommissionForm.commissionAmount || 0);
+      const totalValue = parseFloat(bankCommissionForm.totalTransactionValue || 0);
+      if (totalValue > 0) {
+        const rate = (commissionAmount / totalValue) * 100;
+        setBankCommissionForm(prev => ({
+          ...prev,
+          commissionRate: rate.toFixed(2),
+        }));
+      }
+    }
+  }, [activeForm, bankCommissionForm.commissionAmount, bankCommissionForm.totalTransactionValue]);
+
+  // Load MoMo transactions for commission form
+  const loadMoMoTransactionsForCommission = async (provider, merchantSimId, commissionType, date) => {
+    try {
+      const branchId = selectedBranchId || userData?.branchId;
+      if (!branchId) return { count: 0, total: 0 };
+      
+      const transactions = await transactionService.getTodayTransactions(
+        branchId,
+        null, // Admin view for commission calculation
+        "admin"
+      );
+      
+      if (!transactions?.momo || !Array.isArray(transactions.momo)) {
+        return { count: 0, total: 0 };
+      }
+      
+      // Filter by provider, merchant SIM, commission type, and date
+      const filtered = transactions.momo.filter(t => {
+        const matchesProvider = t.provider === provider;
+        const matchesSim = merchantSimId ? t.merchantSimId === merchantSimId : true;
+        const matchesType = t.transactionType === commissionType;
+        // Check date match (handle both string and Timestamp)
+        const tDate = t.date?.toDate ? t.date.toDate().toISOString().split("T")[0] : (typeof t.date === 'string' ? t.date : new Date(t.date).toISOString().split("T")[0]);
+        const matchesDate = tDate === date;
+        return matchesProvider && matchesSim && matchesType && matchesDate;
+      });
+      
+      const count = filtered.length;
+      const total = filtered.reduce((sum, t) => sum + parseFloat(t.amount || 0), 0);
+      
+      return { count, total };
+    } catch (error) {
+      console.error("Error loading MoMo transactions:", error);
+      return { count: 0, total: 0 };
+    }
+  };
+
+  // Auto-populate MoMo commission fields when provider/sim/type/date changes
+  useEffect(() => {
+    if (activeForm === "momo_commission" && momoCommissionForm.provider && momoCommissionForm.merchantSimId && momoCommissionForm.commissionType && momoCommissionForm.date) {
+      const loadData = async () => {
+        const { count, total } = await loadMoMoTransactionsForCommission(
+          momoCommissionForm.provider,
+          momoCommissionForm.merchantSimId,
+          momoCommissionForm.commissionType,
+          momoCommissionForm.date
+        );
+        setMomoCommissionForm(prev => ({
+          ...prev,
+          numberOfTransactions: count.toString(),
+          totalTransactionValue: total.toFixed(2),
+        }));
+      };
+      loadData();
+    }
+  }, [activeForm, momoCommissionForm.provider, momoCommissionForm.merchantSimId, momoCommissionForm.commissionType, momoCommissionForm.date]);
+
+  // Auto-calculate commission rate from commission earned
+  useEffect(() => {
+    if (activeForm === "momo_commission" && momoCommissionForm.commissionEarned && momoCommissionForm.totalTransactionValue) {
+      const commissionEarned = parseFloat(momoCommissionForm.commissionEarned || 0);
+      const totalValue = parseFloat(momoCommissionForm.totalTransactionValue || 0);
+      if (totalValue > 0) {
+        const rate = (commissionEarned / totalValue) * 100;
+        setMomoCommissionForm(prev => ({
+          ...prev,
+          commissionRate: rate.toFixed(2),
+        }));
+      }
+    }
+  }, [activeForm, momoCommissionForm.commissionEarned, momoCommissionForm.totalTransactionValue]);
 
   // Helper function to get businessId and branchId with fallbacks
   const getBusinessAndBranchIds = () => {
+    // For IT admins, use selected IDs; for others, use userData IDs
     const businessId = selectedBusinessId || userData?.businessId;
     const branchId = selectedBranchId || userData?.branchId;
+    
     return { businessId, branchId };
   };
 
@@ -163,6 +429,25 @@ export default function Transactions() {
                 else if (t.provider === "AirtelTigo") airtelTigoEcash += amount;
                 else if (t.provider === "Telecel") telecelEcash += amount;
               }
+            }
+          });
+        }
+        
+        // Process bank transactions to update physical cash
+        if (transactions?.bank && Array.isArray(transactions.bank)) {
+          transactions.bank.forEach((t) => {
+            const amount = parseFloat(t.amount || 0);
+            if (isNaN(amount) || amount <= 0) return;
+            
+            // Deposit: Customer deposits money into bank account → Agent receives physical cash
+            // Physical Cash increases
+            if (t.transactionType === "deposit") {
+              physicalCash += amount; // Agent receives physical cash
+            } 
+            // Withdrawal: Customer withdraws money from bank account → Agent gives physical cash
+            // Physical Cash decreases
+            else if (t.transactionType === "withdrawal") {
+              physicalCash -= amount; // Agent gives physical cash
             }
           });
         }
@@ -376,64 +661,16 @@ export default function Transactions() {
     }
   };
 
-  const [bankCommissionForm, setBankCommissionForm] = useState({
-    date: new Date().toISOString().split("T")[0],
-    bankName: "Ecobank",
-    commissionType: "deposit",
-    numberOfTransactions: "",
-    totalTransactionValue: "",
-    commissionRate: "",
-    commissionAmount: "",
-    commissionReceived: false,
-    paymentDate: "",
-    balance: "",
-    remarks: "",
-  });
-
-  const [momoCommissionForm, setMomoCommissionForm] = useState({
-    date: new Date().toISOString().split("T")[0],
-    provider: "MTN",
-    commissionType: "cash_in",
-    numberOfTransactions: "",
-    totalTransactionValue: "",
-    commissionRate: "",
-    commissionEarned: "",
-    commissionPaymentType: "physical",
-    balance: "",
-    remarks: "",
-  });
-
   const [simSaleForm, setSimSaleForm] = useState({
     date: new Date().toISOString().split("T")[0],
     provider: "MTN",
     simType: "regular",
     customerName: "",
-    customerNumber: "",
-    customerGhanaCard: "",
     quantity: "",
     unitPrice: "",
     totalAmount: "",
     paymentMethod: "cash",
     registrationStatus: "registered",
-    agentCommission: "",
-    balance: "",
-    remarks: "",
-  });
-
-  const [expenseForm, setExpenseForm] = useState({
-    date: new Date().toISOString().split("T")[0],
-    expenseCategory: "transport",
-    description: "",
-    quantity: "",
-    unitPrice: "",
-    amountPaid: "",
-    amountReceived: "",
-    paymentMethod: "cash",
-    paidTo: "",
-    approvedBy: "",
-    receiptNumber: "",
-    attachmentUrl: "",
-    pettyCashBalance: "",
     remarks: "",
   });
 
@@ -881,14 +1118,15 @@ export default function Transactions() {
                 e.preventDefault();
                 setLoading(true);
                 try {
-                  const amount = parseFloat(bankForm.amount || 0);
-                  const physicalBefore = parseFloat(bankForm.physicalCashBefore || currentBalances.physicalCash);
+                  const roundTo2 = (num) => Math.round((num + Number.EPSILON) * 100) / 100;
+                  const amount = roundTo2(parseFloat(bankForm.amount || 0));
+                  const physicalBefore = roundTo2(currentBalances.physicalCash);
                   let physicalAfter = physicalBefore;
                   
                   if (bankForm.transactionType === "deposit") {
-                    physicalAfter = physicalBefore + amount;
+                    physicalAfter = roundTo2(physicalBefore + amount);
                   } else if (bankForm.transactionType === "withdrawal") {
-                    physicalAfter = physicalBefore - amount;
+                    physicalAfter = roundTo2(physicalBefore - amount);
                   }
 
                   const { businessId, branchId } = getBusinessAndBranchIds();
@@ -1080,9 +1318,16 @@ export default function Transactions() {
                     id="bankPhysicalCashBefore"
                     type="number"
                     step="0.01"
-                    value={bankForm.physicalCashBefore || currentBalances.physicalCash}
+                    value={(() => {
+                      const roundTo2 = (num) => Math.round((num + Number.EPSILON) * 100) / 100;
+                      return roundTo2(currentBalances.physicalCash).toFixed(2);
+                    })()}
                     readOnly
+                    className="bg-muted"
                   />
+                  <p className="text-xs text-muted-foreground">
+                    Latest balance from opening float + all transactions
+                  </p>
                 </div>
               </div>
 
@@ -1092,11 +1337,23 @@ export default function Transactions() {
                   id="bankPhysicalCashAfter"
                   type="number"
                   step="0.01"
-                  value={bankForm.physicalCashAfter || (bankForm.transactionType === "deposit"
-                    ? (parseFloat(bankForm.physicalCashBefore || currentBalances.physicalCash) + parseFloat(bankForm.amount || 0))
-                    : (parseFloat(bankForm.physicalCashBefore || currentBalances.physicalCash) - parseFloat(bankForm.amount || 0)))}
+                  value={(() => {
+                    const roundTo2 = (num) => Math.round((num + Number.EPSILON) * 100) / 100;
+                    const before = roundTo2(currentBalances.physicalCash);
+                    const amount = roundTo2(parseFloat(bankForm.amount || 0));
+                    if (bankForm.transactionType === "deposit") {
+                      return roundTo2(before + amount).toFixed(2);
+                    } else if (bankForm.transactionType === "withdrawal") {
+                      return roundTo2(before - amount).toFixed(2);
+                    }
+                    return before.toFixed(2);
+                  })()}
                   readOnly
+                  className="bg-muted"
                 />
+                <p className="text-xs text-muted-foreground">
+                  Calculated based on transaction type and amount
+                </p>
               </div>
 
               <div className="space-y-2">
@@ -1149,14 +1406,12 @@ export default function Transactions() {
                   setBankCommissionForm({
                     date: new Date().toISOString().split("T")[0],
                     bankName: "Ecobank",
-                    commissionType: "deposit",
+                    commissionType: "All",
                     numberOfTransactions: "",
                     totalTransactionValue: "",
                     commissionRate: "",
                     commissionAmount: "",
                     commissionReceived: false,
-                    paymentDate: "",
-                    balance: "",
                     remarks: "",
                   });
                   setActiveForm(null);
@@ -1184,7 +1439,15 @@ export default function Transactions() {
                   <Select
                     id="bcBankName"
                     value={bankCommissionForm.bankName}
-                    onChange={(e) => setBankCommissionForm({ ...bankCommissionForm, bankName: e.target.value })}
+                    onChange={(e) => {
+                      const newBankName = e.target.value;
+                      setBankCommissionForm({ 
+                        ...bankCommissionForm, 
+                        bankName: newBankName,
+                        // Set commission type to "All" if not Ecobank
+                        commissionType: newBankName === "Ecobank" ? bankCommissionForm.commissionType : "All"
+                      });
+                    }}
                     required
                   >
                     <option value="Ecobank">Ecobank</option>
@@ -1196,34 +1459,37 @@ export default function Transactions() {
                 </div>
               </div>
 
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="bcCommissionType">Commission Type *</Label>
-                  <Select
-                    id="bcCommissionType"
-                    value={bankCommissionForm.commissionType}
-                    onChange={(e) => setBankCommissionForm({ ...bankCommissionForm, commissionType: e.target.value })}
-                    required
-                  >
-                    <option value="deposit">Deposit</option>
-                    <option value="withdrawal">Withdrawal</option>
-                    <option value="transfer">Transfer</option>
-                    <option value="standing_order">Standing Order</option>
-                  </Select>
+              {bankCommissionForm.bankName === "Ecobank" && (
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label htmlFor="bcCommissionType">Commission Type *</Label>
+                    <Select
+                      id="bcCommissionType"
+                      value={bankCommissionForm.commissionType}
+                      onChange={(e) => setBankCommissionForm({ ...bankCommissionForm, commissionType: e.target.value })}
+                      required
+                    >
+                      <option value="PO">PO</option>
+                      <option value="deposit">Deposit</option>
+                      <option value="withdrawal">Withdrawal</option>
+                    </Select>
+                  </div>
                 </div>
+              )}
+
+              <div className="grid gap-4 md:grid-cols-2">
                 <div className="space-y-2">
                   <Label htmlFor="bcNumberOfTransactions">Number of Transactions *</Label>
                   <Input
                     id="bcNumberOfTransactions"
                     type="number"
                     value={bankCommissionForm.numberOfTransactions}
-                    onChange={(e) => setBankCommissionForm({ ...bankCommissionForm, numberOfTransactions: e.target.value })}
+                    readOnly
+                    className="bg-muted"
                     required
                   />
+                  <p className="text-xs text-muted-foreground">Auto-filled from bank transactions</p>
                 </div>
-              </div>
-
-              <div className="grid gap-4 md:grid-cols-2">
                 <div className="space-y-2">
                   <Label htmlFor="bcTotalValue">Total Transaction Value (GHS) *</Label>
                   <Input
@@ -1231,19 +1497,11 @@ export default function Transactions() {
                     type="number"
                     step="0.01"
                     value={bankCommissionForm.totalTransactionValue}
-                    onChange={(e) => setBankCommissionForm({ ...bankCommissionForm, totalTransactionValue: e.target.value })}
+                    readOnly
+                    className="bg-muted"
                     required
                   />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="bcCommissionRate">Commission Rate (%)</Label>
-                  <Input
-                    id="bcCommissionRate"
-                    type="number"
-                    step="0.01"
-                    value={bankCommissionForm.commissionRate}
-                    onChange={(e) => setBankCommissionForm({ ...bankCommissionForm, commissionRate: e.target.value })}
-                  />
+                  <p className="text-xs text-muted-foreground">Auto-filled from bank transactions</p>
                 </div>
               </div>
 
@@ -1260,37 +1518,28 @@ export default function Transactions() {
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="bcPaymentDate">Payment Date</Label>
+                  <Label htmlFor="bcCommissionRate">Commission Rate (%)</Label>
                   <Input
-                    id="bcPaymentDate"
-                    type="date"
-                    value={bankCommissionForm.paymentDate}
-                    onChange={(e) => setBankCommissionForm({ ...bankCommissionForm, paymentDate: e.target.value })}
+                    id="bcCommissionRate"
+                    type="number"
+                    step="0.01"
+                    value={bankCommissionForm.commissionRate}
+                    readOnly
+                    className="bg-muted"
                   />
+                  <p className="text-xs text-muted-foreground">Auto-calculated from Commission Amount</p>
                 </div>
               </div>
 
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="bcBalance">Balance (GHS)</Label>
-                  <Input
-                    id="bcBalance"
-                    type="number"
-                    step="0.01"
-                    value={bankCommissionForm.balance}
-                    onChange={(e) => setBankCommissionForm({ ...bankCommissionForm, balance: e.target.value })}
-                  />
-                </div>
-                <div className="space-y-2 flex items-center">
-                  <input
-                    type="checkbox"
-                    id="bcCommissionReceived"
-                    checked={bankCommissionForm.commissionReceived}
-                    onChange={(e) => setBankCommissionForm({ ...bankCommissionForm, commissionReceived: e.target.checked })}
-                    className="mr-2"
-                  />
-                  <Label htmlFor="bcCommissionReceived">Commission Received</Label>
-                </div>
+              <div className="space-y-2 flex items-center">
+                <input
+                  type="checkbox"
+                  id="bcCommissionReceived"
+                  checked={bankCommissionForm.commissionReceived}
+                  onChange={(e) => setBankCommissionForm({ ...bankCommissionForm, commissionReceived: e.target.checked })}
+                  className="mr-2"
+                />
+                <Label htmlFor="bcCommissionReceived">Commission Received</Label>
               </div>
 
               <div className="space-y-2">
@@ -1321,43 +1570,49 @@ export default function Transactions() {
             <CardTitle>MoMo E-Cash Commissions</CardTitle>
           </CardHeader>
           <CardContent>
+            {/* List of recorded commissions */}
+            {momoCommissions.length > 0 && (
+              <div className="mb-6 p-4 bg-muted rounded-lg">
+                <h3 className="font-semibold mb-2">Recorded Commissions ({momoCommissions.length})</h3>
+                <div className="space-y-2">
+                  {momoCommissions.map((comm, idx) => (
+                    <div key={idx} className="text-sm p-2 bg-background rounded">
+                      {comm.merchantSimName} - {comm.commissionType} - GHS {comm.commissionEarned}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             <form
               onSubmit={async (e) => {
                 e.preventDefault();
-                setLoading(true);
-                try {
-                  const { businessId, branchId } = getBusinessAndBranchIds();
-                  if (!businessId || !branchId) {
-                    alert("Error: Business ID or Branch ID is missing.");
-                    setLoading(false);
-                    return;
-                  }
-                  await commissionService.createMoMoCommission({
-                    businessId,
-                    branchId,
-                    ...momoCommissionForm,
-                    recordedBy: userData.userId,
-                    recordedByName: userData.name || userData.email,
-                  });
-                  alert("MoMo commission recorded successfully!");
-                  setMomoCommissionForm({
-                    date: new Date().toISOString().split("T")[0],
-                    provider: "MTN",
-                    commissionType: "cash_in",
-                    numberOfTransactions: "",
-                    totalTransactionValue: "",
-                    commissionRate: "",
-                    commissionEarned: "",
-                    commissionPaymentType: "physical",
-                    balance: "",
-                    remarks: "",
-                  });
-                  setActiveForm(null);
-                } catch (error) {
-                  alert("Error: " + error.message);
-                } finally {
-                  setLoading(false);
+                if (!momoCommissionForm.provider || !momoCommissionForm.merchantSimId || !momoCommissionForm.commissionType || !momoCommissionForm.commissionEarned) {
+                  alert("Please fill all required fields");
+                  return;
                 }
+                
+                // Add to commissions list
+                const newCommission = {
+                  ...momoCommissionForm,
+                  date: momoCommissionForm.date || new Date().toISOString().split("T")[0],
+                  time: new Date().toLocaleTimeString(),
+                };
+                setMomoCommissions([...momoCommissions, newCommission]);
+                
+                // Reset form for next entry
+                setMomoCommissionForm({
+                  date: new Date().toISOString().split("T")[0],
+                  provider: "",
+                  merchantSimId: "",
+                  merchantSimName: "",
+                  commissionType: "",
+                  numberOfTransactions: "",
+                  totalTransactionValue: "",
+                  commissionRate: "",
+                  commissionEarned: "",
+                  remarks: "",
+                });
               }}
               className="space-y-4"
             >
@@ -1377,9 +1632,16 @@ export default function Transactions() {
                   <Select
                     id="mcProvider"
                     value={momoCommissionForm.provider}
-                    onChange={(e) => setMomoCommissionForm({ ...momoCommissionForm, provider: e.target.value })}
+                    onChange={(e) => setMomoCommissionForm({ 
+                      ...momoCommissionForm, 
+                      provider: e.target.value,
+                      merchantSimId: "", // Reset merchant SIM when provider changes
+                      merchantSimName: "",
+                      commissionType: "", // Reset commission type
+                    })}
                     required
                   >
+                    <option value="">Select Provider</option>
                     <option value="MTN">MTN</option>
                     <option value="Vodafone">Vodafone</option>
                     <option value="AirtelTigo">AirtelTigo</option>
@@ -1388,113 +1650,224 @@ export default function Transactions() {
                 </div>
               </div>
 
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="mcCommissionType">Commission Type *</Label>
-                  <Select
-                    id="mcCommissionType"
-                    value={momoCommissionForm.commissionType}
-                    onChange={(e) => setMomoCommissionForm({ ...momoCommissionForm, commissionType: e.target.value })}
-                    required
-                  >
-                    <option value="cash_in">Cash-In</option>
-                    <option value="cash_out">Cash-Out</option>
-                    <option value="transfer">Transfer</option>
-                    <option value="bill_payment">Bill Payment</option>
-                  </Select>
+              {momoCommissionForm.provider && (
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label htmlFor="mcMerchantSim">Merchant SIM *</Label>
+                    <Select
+                      id="mcMerchantSim"
+                      value={momoCommissionForm.merchantSimId}
+                      onChange={(e) => {
+                        const selectedSim = merchantSims.find(s => s.merchantSimId === e.target.value);
+                        setMomoCommissionForm({ 
+                          ...momoCommissionForm, 
+                          merchantSimId: e.target.value,
+                          merchantSimName: selectedSim?.simName || "",
+                          commissionType: "", // Reset commission type
+                        });
+                      }}
+                      required
+                    >
+                      <option value="">Select Merchant SIM</option>
+                      {merchantSims
+                        .filter(sim => sim.provider === momoCommissionForm.provider)
+                        .map(sim => (
+                          <option key={sim.merchantSimId} value={sim.merchantSimId}>
+                            {sim.simName}
+                          </option>
+                        ))}
+                    </Select>
+                  </div>
                 </div>
-                <div className="space-y-2">
-                  <Label htmlFor="mcNumberOfTransactions">Number of Transactions *</Label>
-                  <Input
-                    id="mcNumberOfTransactions"
-                    type="number"
-                    value={momoCommissionForm.numberOfTransactions}
-                    onChange={(e) => setMomoCommissionForm({ ...momoCommissionForm, numberOfTransactions: e.target.value })}
-                    required
-                  />
-                </div>
-              </div>
+              )}
 
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="mcTotalValue">Total Transaction Value (GHS) *</Label>
-                  <Input
-                    id="mcTotalValue"
-                    type="number"
-                    step="0.01"
-                    value={momoCommissionForm.totalTransactionValue}
-                    onChange={(e) => setMomoCommissionForm({ ...momoCommissionForm, totalTransactionValue: e.target.value })}
-                    required
-                  />
+              {momoCommissionForm.merchantSimId && (
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label htmlFor="mcCommissionType">Commission Type *</Label>
+                    <Select
+                      id="mcCommissionType"
+                      value={momoCommissionForm.commissionType}
+                      onChange={(e) => setMomoCommissionForm({ ...momoCommissionForm, commissionType: e.target.value })}
+                      required
+                    >
+                      <option value="">Select Commission Type</option>
+                      <option value="cash_in">Cash-In</option>
+                      <option value="cash_out">Cash-Out</option>
+                    </Select>
+                  </div>
                 </div>
-                <div className="space-y-2">
-                  <Label htmlFor="mcCommissionRate">Commission Rate (%)</Label>
-                  <Input
-                    id="mcCommissionRate"
-                    type="number"
-                    step="0.01"
-                    value={momoCommissionForm.commissionRate}
-                    onChange={(e) => setMomoCommissionForm({ ...momoCommissionForm, commissionRate: e.target.value })}
-                  />
-                </div>
-              </div>
+              )}
 
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="mcCommissionEarned">Commission Earned (GHS) *</Label>
-                  <Input
-                    id="mcCommissionEarned"
-                    type="number"
-                    step="0.01"
-                    value={momoCommissionForm.commissionEarned}
-                    onChange={(e) => setMomoCommissionForm({ ...momoCommissionForm, commissionEarned: e.target.value })}
-                    required
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="mcPaymentType">Commission Payment Type *</Label>
-                  <Select
-                    id="mcPaymentType"
-                    value={momoCommissionForm.commissionPaymentType}
-                    onChange={(e) => setMomoCommissionForm({ ...momoCommissionForm, commissionPaymentType: e.target.value })}
-                    required
-                  >
-                    <option value="physical">Physical</option>
-                    <option value="ecash">E-Cash</option>
-                  </Select>
-                </div>
-              </div>
+              {momoCommissionForm.commissionType && (
+                <>
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <div className="space-y-2">
+                      <Label htmlFor="mcNumberOfTransactions">Number of Transactions *</Label>
+                      <Input
+                        id="mcNumberOfTransactions"
+                        type="number"
+                        value={momoCommissionForm.numberOfTransactions}
+                        readOnly
+                        className="bg-muted"
+                        required
+                      />
+                      <p className="text-xs text-muted-foreground">Auto-filled from transactions</p>
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="mcTotalValue">Total Transaction Value (GHS) *</Label>
+                      <Input
+                        id="mcTotalValue"
+                        type="number"
+                        step="0.01"
+                        value={momoCommissionForm.totalTransactionValue}
+                        readOnly
+                        className="bg-muted"
+                        required
+                      />
+                      <p className="text-xs text-muted-foreground">Auto-filled from transactions</p>
+                    </div>
+                  </div>
 
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="mcBalance">Balance (GHS)</Label>
-                  <Input
-                    id="mcBalance"
-                    type="number"
-                    step="0.01"
-                    value={momoCommissionForm.balance}
-                    onChange={(e) => setMomoCommissionForm({ ...momoCommissionForm, balance: e.target.value })}
-                  />
-                </div>
-              </div>
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <div className="space-y-2">
+                      <Label htmlFor="mcCommissionEarned">Commission Earned (GHS) *</Label>
+                      <Input
+                        id="mcCommissionEarned"
+                        type="number"
+                        step="0.01"
+                        value={momoCommissionForm.commissionEarned}
+                        onChange={(e) => setMomoCommissionForm({ ...momoCommissionForm, commissionEarned: e.target.value })}
+                        required
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="mcCommissionRate">Commission Rate (%)</Label>
+                      <Input
+                        id="mcCommissionRate"
+                        type="number"
+                        step="0.01"
+                        value={momoCommissionForm.commissionRate}
+                        readOnly
+                        className="bg-muted"
+                      />
+                      <p className="text-xs text-muted-foreground">Auto-calculated from Commission Earned</p>
+                    </div>
+                  </div>
 
-              <div className="space-y-2">
-                <Label htmlFor="mcRemarks">Remarks</Label>
-                <Input
-                  id="mcRemarks"
-                  value={momoCommissionForm.remarks}
-                  onChange={(e) => setMomoCommissionForm({ ...momoCommissionForm, remarks: e.target.value })}
-                />
-              </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="mcRemarks">Remarks</Label>
+                    <Input
+                      id="mcRemarks"
+                      value={momoCommissionForm.remarks}
+                      onChange={(e) => setMomoCommissionForm({ ...momoCommissionForm, remarks: e.target.value })}
+                    />
+                  </div>
 
-              <div className="flex justify-end gap-4">
-                <Button type="button" variant="outline" onClick={() => setActiveForm(null)}>
-                  Cancel
-                </Button>
-                <Button type="submit" disabled={loading}>
-                  {loading ? "Recording..." : "Record Commission"}
-                </Button>
-              </div>
+                  <div className="flex justify-end gap-4">
+                    <Button 
+                      type="button" 
+                      variant="outline" 
+                      onClick={() => {
+                        setMomoCommissions([]);
+                        setMomoCommissionForm({
+                          date: new Date().toISOString().split("T")[0],
+                          provider: "",
+                          merchantSimId: "",
+                          merchantSimName: "",
+                          commissionType: "",
+                          numberOfTransactions: "",
+                          totalTransactionValue: "",
+                          commissionRate: "",
+                          commissionEarned: "",
+                          remarks: "",
+                        });
+                        setActiveForm(null);
+                      }}
+                    >
+                      Cancel
+                    </Button>
+                    <Button type="button" variant="secondary" onClick={async () => {
+                      // Add current commission to list
+                      if (!momoCommissionForm.provider || !momoCommissionForm.merchantSimId || !momoCommissionForm.commissionType || !momoCommissionForm.commissionEarned) {
+                        alert("Please fill all required fields");
+                        return;
+                      }
+                      const newCommission = {
+                        ...momoCommissionForm,
+                        date: momoCommissionForm.date || new Date().toISOString().split("T")[0],
+                        time: new Date().toLocaleTimeString(),
+                      };
+                      setMomoCommissions([...momoCommissions, newCommission]);
+                      setMomoCommissionForm({
+                        date: new Date().toISOString().split("T")[0],
+                        provider: "",
+                        merchantSimId: "",
+                        merchantSimName: "",
+                        commissionType: "",
+                        numberOfTransactions: "",
+                        totalTransactionValue: "",
+                        commissionRate: "",
+                        commissionEarned: "",
+                        remarks: "",
+                      });
+                    }}>
+                      Add Another Commission
+                    </Button>
+                    <Button 
+                      type="submit" 
+                      disabled={loading || momoCommissions.length === 0}
+                      onClick={async (e) => {
+                        e.preventDefault();
+                        if (momoCommissions.length === 0) {
+                          alert("Please add at least one commission");
+                          return;
+                        }
+                        setLoading(true);
+                        try {
+                          const { businessId, branchId } = getBusinessAndBranchIds();
+                          if (!businessId || !branchId) {
+                            alert("Error: Business ID or Branch ID is missing.");
+                            setLoading(false);
+                            return;
+                          }
+                          // Save all commissions
+                          for (const comm of momoCommissions) {
+                            await commissionService.createMoMoCommission({
+                              businessId,
+                              branchId,
+                              ...comm,
+                              recordedBy: userData.userId,
+                              recordedByName: userData.name || userData.email,
+                            });
+                          }
+                          alert(`${momoCommissions.length} commission(s) recorded successfully!`);
+                          setMomoCommissions([]);
+                          setMomoCommissionForm({
+                            date: new Date().toISOString().split("T")[0],
+                            provider: "",
+                            merchantSimId: "",
+                            merchantSimName: "",
+                            commissionType: "",
+                            numberOfTransactions: "",
+                            totalTransactionValue: "",
+                            commissionRate: "",
+                            commissionEarned: "",
+                            remarks: "",
+                          });
+                          setActiveForm(null);
+                        } catch (error) {
+                          alert("Error: " + error.message);
+                        } finally {
+                          setLoading(false);
+                        }
+                      }}
+                    >
+                      {loading ? "Saving..." : `Save All Commissions (${momoCommissions.length})`}
+                    </Button>
+                  </div>
+                </>
+              )}
             </form>
           </CardContent>
         </Card>
@@ -1532,15 +1905,11 @@ export default function Transactions() {
                     provider: "MTN",
                     simType: "regular",
                     customerName: "",
-                    customerNumber: "",
-                    customerGhanaCard: "",
                     quantity: "",
                     unitPrice: "",
                     totalAmount: "",
                     paymentMethod: "cash",
                     registrationStatus: "registered",
-                    agentCommission: "",
-                    balance: "",
                     remarks: "",
                   });
                   setActiveForm(null);
@@ -1604,27 +1973,6 @@ export default function Transactions() {
                 </div>
               </div>
 
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="simCustomerNumber">Customer Phone *</Label>
-                  <Input
-                    id="simCustomerNumber"
-                    type="tel"
-                    value={simSaleForm.customerNumber}
-                    onChange={(e) => setSimSaleForm({ ...simSaleForm, customerNumber: e.target.value })}
-                    required
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="simGhanaCard">Customer Ghana Card *</Label>
-                  <Input
-                    id="simGhanaCard"
-                    value={simSaleForm.customerGhanaCard}
-                    onChange={(e) => setSimSaleForm({ ...simSaleForm, customerGhanaCard: e.target.value })}
-                    required
-                  />
-                </div>
-              </div>
 
               <div className="grid gap-4 md:grid-cols-2">
                 <div className="space-y-2">
@@ -1688,29 +2036,6 @@ export default function Transactions() {
                     <option value="unregistered">Unregistered</option>
                   </Select>
                 </div>
-                <div className="space-y-2">
-                  <Label htmlFor="simAgentCommission">Agent Commission (GHS)</Label>
-                  <Input
-                    id="simAgentCommission"
-                    type="number"
-                    step="0.01"
-                    value={simSaleForm.agentCommission}
-                    onChange={(e) => setSimSaleForm({ ...simSaleForm, agentCommission: e.target.value })}
-                  />
-                </div>
-              </div>
-
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="simBalance">Balance (GHS)</Label>
-                  <Input
-                    id="simBalance"
-                    type="number"
-                    step="0.01"
-                    value={simSaleForm.balance}
-                    onChange={(e) => setSimSaleForm({ ...simSaleForm, balance: e.target.value })}
-                  />
-                </div>
               </div>
 
               <div className="space-y-2">
@@ -1748,7 +2073,10 @@ export default function Transactions() {
                 try {
                   const { businessId, branchId } = getBusinessAndBranchIds();
                   if (!businessId || !branchId) {
-                    alert("Error: Business ID or Branch ID is missing.");
+                    const missing = [];
+                    if (!businessId) missing.push("Business ID");
+                    if (!branchId) missing.push("Branch ID");
+                    alert(`Error: ${missing.join(" and ")} ${missing.length > 1 ? "are" : "is"} missing. Please ensure you're properly assigned to a business and branch.`);
                     setLoading(false);
                     return;
                   }
@@ -1756,8 +2084,8 @@ export default function Transactions() {
                     businessId,
                     branchId,
                     ...expenseForm,
-                    recordedBy: userData.userId,
-                    recordedByName: userData.name || userData.email,
+                    recordedBy: userData?.userId,
+                    recordedByName: userData?.name || userData?.email,
                   });
                   alert("Expense recorded successfully!");
                   setExpenseForm({
@@ -1770,9 +2098,6 @@ export default function Transactions() {
                     amountReceived: "",
                     paymentMethod: "cash",
                     paidTo: "",
-                    approvedBy: "",
-                    receiptNumber: "",
-                    attachmentUrl: "",
                     pettyCashBalance: "",
                     remarks: "",
                   });
@@ -1827,27 +2152,29 @@ export default function Transactions() {
                 />
               </div>
 
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="expQuantity">Quantity</Label>
-                  <Input
-                    id="expQuantity"
-                    type="number"
-                    value={expenseForm.quantity}
-                    onChange={(e) => setExpenseForm({ ...expenseForm, quantity: e.target.value })}
-                  />
+              {categoriesRequiringQuantity.includes(expenseForm.expenseCategory) && (
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label htmlFor="expQuantity">Quantity</Label>
+                    <Input
+                      id="expQuantity"
+                      type="number"
+                      value={expenseForm.quantity}
+                      onChange={(e) => setExpenseForm({ ...expenseForm, quantity: e.target.value })}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="expUnitPrice">Unit Price (GHS)</Label>
+                    <Input
+                      id="expUnitPrice"
+                      type="number"
+                      step="0.01"
+                      value={expenseForm.unitPrice}
+                      onChange={(e) => setExpenseForm({ ...expenseForm, unitPrice: e.target.value })}
+                    />
+                  </div>
                 </div>
-                <div className="space-y-2">
-                  <Label htmlFor="expUnitPrice">Unit Price (GHS)</Label>
-                  <Input
-                    id="expUnitPrice"
-                    type="number"
-                    step="0.01"
-                    value={expenseForm.unitPrice}
-                    onChange={(e) => setExpenseForm({ ...expenseForm, unitPrice: e.target.value })}
-                  />
-                </div>
-              </div>
+              )}
 
               <div className="grid gap-4 md:grid-cols-2">
                 <div className="space-y-2">
@@ -1867,8 +2194,12 @@ export default function Transactions() {
                     type="number"
                     step="0.01"
                     value={expenseForm.amountReceived}
-                    onChange={(e) => setExpenseForm({ ...expenseForm, amountReceived: e.target.value })}
+                    readOnly
+                    className="bg-muted"
                   />
+                  <p className="text-xs text-muted-foreground">
+                    Auto-filled from latest disbursement
+                  </p>
                 </div>
               </div>
 
@@ -1898,41 +2229,18 @@ export default function Transactions() {
 
               <div className="grid gap-4 md:grid-cols-2">
                 <div className="space-y-2">
-                  <Label htmlFor="expApprovedBy">Approved By</Label>
-                  <Input
-                    id="expApprovedBy"
-                    value={expenseForm.approvedBy}
-                    onChange={(e) => setExpenseForm({ ...expenseForm, approvedBy: e.target.value })}
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="expReceiptNumber">Receipt Number</Label>
-                  <Input
-                    id="expReceiptNumber"
-                    value={expenseForm.receiptNumber}
-                    onChange={(e) => setExpenseForm({ ...expenseForm, receiptNumber: e.target.value })}
-                  />
-                </div>
-              </div>
-
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="expAttachmentUrl">Attachment URL</Label>
-                  <Input
-                    id="expAttachmentUrl"
-                    value={expenseForm.attachmentUrl}
-                    onChange={(e) => setExpenseForm({ ...expenseForm, attachmentUrl: e.target.value })}
-                  />
-                </div>
-                <div className="space-y-2">
                   <Label htmlFor="expPettyCashBalance">Petty Cash Balance (GHS)</Label>
                   <Input
                     id="expPettyCashBalance"
                     type="number"
                     step="0.01"
                     value={expenseForm.pettyCashBalance}
-                    onChange={(e) => setExpenseForm({ ...expenseForm, pettyCashBalance: e.target.value })}
+                    readOnly
+                    className="bg-muted"
                   />
+                  <p className="text-xs text-muted-foreground">
+                    Auto-calculated: Amount Received - Amount Paid
+                  </p>
                 </div>
               </div>
 

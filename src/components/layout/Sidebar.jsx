@@ -13,6 +13,7 @@ import {
   Activity,
   LogOut,
   X,
+  Wallet,
 } from "lucide-react";
 import { Button } from "../ui/button";
 import { cn } from "../../utils/cn";
@@ -27,6 +28,7 @@ const menuItems = {
     { icon: Receipt, label: "Transactions", path: "/transactions" },
     { icon: DollarSign, label: "Float", path: "/float" },
     { icon: FileCheck, label: "Reconciliation", path: "/reconciliation" },
+    { icon: Wallet, label: "Disbursement", path: "/disbursement" },
     { icon: BarChart3, label: "Reports", path: "/reports" },
   ],
   admin: [
@@ -36,6 +38,7 @@ const menuItems = {
     { icon: Receipt, label: "Transactions", path: "/transactions" },
     { icon: DollarSign, label: "Float", path: "/float" },
     { icon: FileCheck, label: "Reconciliation", path: "/reconciliation" },
+    { icon: Wallet, label: "Disbursement", path: "/disbursement" },
     { icon: BarChart3, label: "Reports", path: "/reports" },
   ],
   branch_manager: [
@@ -45,6 +48,7 @@ const menuItems = {
     { icon: Receipt, label: "Transactions", path: "/transactions" },
     { icon: DollarSign, label: "Float", path: "/float" },
     { icon: FileCheck, label: "Reconciliation", path: "/reconciliation" },
+    { icon: Wallet, label: "Disbursement", path: "/disbursement" },
     { icon: BarChart3, label: "Reports", path: "/reports" },
   ],
   agent_user: [

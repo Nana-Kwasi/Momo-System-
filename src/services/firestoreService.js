@@ -743,6 +743,78 @@ export const expenseService = {
   },
 };
 
+export const disbursementService = {
+  async create(data) {
+    const disbursementId = generateId();
+    const disbursementData = {
+      disbursementId,
+      date: Timestamp.fromDate(new Date(data.date || new Date())),
+      createdAt: Timestamp.now(),
+      ...data,
+    };
+    await addDoc(collection(db, "disbursements"), disbursementData);
+    return disbursementId;
+  },
+
+  async getLatestByBranch(branchId) {
+    try {
+      // Try with orderBy first
+      try {
+        const q = query(
+          collection(db, "disbursements"),
+          where("branchId", "==", branchId),
+          orderBy("createdAt", "desc"),
+          limit(1)
+        );
+        const snapshot = await getDocs(q);
+        if (snapshot.empty) return null;
+        return { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
+      } catch (orderByError) {
+        // If orderBy fails (missing index), try without orderBy and sort in memory
+        handleFirestoreError(orderByError, "disbursements getLatestByBranch (with orderBy)");
+        const q = query(
+          collection(db, "disbursements"),
+          where("branchId", "==", branchId),
+          limit(50) // Get more to sort in memory
+        );
+        const snapshot = await getDocs(q);
+        if (snapshot.empty) return null;
+        
+        // Sort by createdAt in memory
+        const disbursements = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+        disbursements.sort((a, b) => {
+          const dateA = a.createdAt?.toDate ? a.createdAt.toDate().getTime() : (a.createdAt?.seconds ? a.createdAt.seconds * 1000 : 0);
+          const dateB = b.createdAt?.toDate ? b.createdAt.toDate().getTime() : (b.createdAt?.seconds ? b.createdAt.seconds * 1000 : 0);
+          return dateB - dateA; // Descending order
+        });
+        
+        return disbursements[0] || null;
+      }
+    } catch (error) {
+      const result = handleFirestoreError(error, "disbursements getLatestByBranch");
+      if (result === null) return null;
+      throw error;
+    }
+  },
+
+  async getByBranch(branchId, limitCount = 50) {
+    try {
+      const q = query(
+        collection(db, "disbursements"),
+        where("branchId", "==", branchId),
+        orderBy("createdAt", "desc"),
+        limit(limitCount)
+      );
+      const snapshot = await getDocs(q);
+      return snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    } catch (error) {
+      const result = handleFirestoreError(error, "disbursements getByBranch");
+      if (result === null) return [];
+      throw error;
+    }
+  },
+};
+
 export const simSaleService = {
   async create(data) {
     const saleId = generateId();

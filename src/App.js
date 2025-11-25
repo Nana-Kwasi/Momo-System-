@@ -17,6 +17,7 @@ import ActivityLogs from "./pages/ActivityLogs";
 import SeedAdmin from "./pages/SeedAdmin";
 import AboutUs from "./pages/AboutUs";
 import Contact from "./pages/Contact";
+import Disbursement from "./pages/Disbursement";
 
 const queryClient = new QueryClient();
 
@@ -67,6 +68,14 @@ function App() {
               <Route path="float" element={<FloatManagement />} />
               <Route path="reconciliation" element={<Reconciliation />} />
               <Route path="transactions" element={<Transactions />} />
+              <Route
+                path="disbursement"
+                element={
+                  <ProtectedRoute allowedRoles={["it_admin", "admin", "branch_manager"]}>
+                    <Disbursement />
+                  </ProtectedRoute>
+                }
+              />
               <Route path="reports" element={<Reports />} />
               <Route
                 path="activity-logs"
