@@ -49,23 +49,13 @@ export default function BranchSelectionModal({ businessId, onSelect, onCancel, o
   }
 
   return (
-    <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-      <Card className="w-full max-w-2xl">
-        <CardHeader>
-          <CardTitle>Select Branch</CardTitle>
-          <CardDescription>
-            Choose which branch you want to access
-          </CardDescription>
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+      <Card className="w-full max-w-2xl shadow-xl border-2">
+        <CardHeader className="border-b border-border">
+          <CardTitle className="text-xl">Select Branch</CardTitle>
+          <CardDescription>Choose which branch you want to access</CardDescription>
         </CardHeader>
-        <CardContent>
-          {canAddNew && (
-            <div className="mb-4">
-              <Button variant="outline" onClick={onAddNew} className="w-full">
-                <Plus className="h-4 w-4 mr-2" />
-                Add New Branch
-              </Button>
-            </div>
-          )}
+        <CardContent className="pt-6">
           <div className="space-y-3 max-h-[400px] overflow-y-auto">
             {branches.length === 0 ? (
               <p className="text-center text-muted-foreground py-8">
@@ -76,10 +66,10 @@ export default function BranchSelectionModal({ businessId, onSelect, onCancel, o
                 <div
                   key={branch.branchId}
                   onClick={() => setSelectedBranchId(branch.branchId)}
-                  className={`p-4 border rounded-md cursor-pointer transition-colors ${
+                  className={`p-4 border-2 rounded-xl cursor-pointer transition-all duration-200 ${
                     selectedBranchId === branch.branchId
-                      ? "border-primary bg-primary/5"
-                      : "hover:bg-accent"
+                      ? "border-primary bg-primary/10 shadow-md"
+                      : "border-border hover:bg-accent hover:border-primary/30"
                   }`}
                 >
                   <div className="flex items-center justify-between">

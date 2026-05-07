@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { userService, branchService, agentBusinessService } from "../services/firestoreService";
+import { userService, branchService, agentBusinessService, activityLogService, dailyFloatService } from "../services/firestoreService";
 import { useAuth } from "../context/AuthContext";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
@@ -10,16 +10,21 @@ import { Badge } from "../components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { createUserWithEmailAndPassword, signOut, signInWithEmailAndPassword } from "firebase/auth";
 import { auth } from "../lib/firebase";
-import { Edit, UserX, UserCheck, RotateCcw } from "lucide-react";
+import { Edit, UserX, UserCheck, RotateCcw, Lock, Unlock, DollarSign, KeyRound } from "lucide-react";
 
 export default function UserManagement() {
   const { userData, login } = useAuth();
   const [users, setUsers] = useState([]);
   const [branches, setBranches] = useState([]);
   const [businesses, setBusinesses] = useState([]);
+  const [filterBusinessId, setFilterBusinessId] = useState("");
+  const [filterBranchId, setFilterBranchId] = useState("");
+  const [filterBranches, setFilterBranches] = useState([]);
   const [loading, setLoading] = useState(false);
   const [showForm, setShowForm] = useState(false);
   const [editingUser, setEditingUser] = useState(null);
+  const [userFloatToday, setUserFloatToday] = useState(null);
+  const [unlockingFloat, setUnlockingFloat] = useState(false);
   const { selectedBusinessId } = useAuth();
   
   const [formData, setFormData] = useState({
@@ -38,7 +43,6 @@ export default function UserManagement() {
   });
 
   useEffect(() => {
-    loadUsers();
     if (userData?.role === "it_admin") {
       loadBusinesses();
     }
@@ -47,13 +51,31 @@ export default function UserManagement() {
     }
   }, [userData, selectedBusinessId]);
 
+  useEffect(() => {
+    loadUsers();
+  }, [userData, selectedBusinessId, filterBusinessId, filterBranchId]);
+
+  useEffect(() => {
+    if (userData?.role === "it_admin" && filterBusinessId) {
+      branchService.getByBusinessId(filterBusinessId).then(setFilterBranches).catch(() => setFilterBranches([]));
+    } else {
+      setFilterBranches([]);
+      if (!filterBusinessId) setFilterBranchId("");
+    }
+  }, [userData?.role, filterBusinessId]);
+
   const loadUsers = async () => {
     try {
       let data;
       if (userData?.role === "it_admin") {
-        data = await userService.getAll();
+        data = await userService.getAll(
+          filterBusinessId || null,
+          filterBranchId || null
+        );
       } else if (userData?.role === "branch_manager") {
         data = await userService.getAll(userData.businessId, userData.branchId);
+      } else if (userData?.role === "admin") {
+        data = await userService.getAll(userData.businessId || null, null);
       } else {
         data = [];
       }
@@ -103,7 +125,9 @@ export default function UserManagement() {
       emergencyContactRelationship: "",
     });
     setEditingUser(null);
+    setUserFloatToday(null);
     setShowForm(false);
+    loadBranches();
   };
 
   const handleSubmit = async (e) => {
@@ -113,6 +137,20 @@ export default function UserManagement() {
       if (editingUser) {
         await userService.update(editingUser.userId, formData);
         alert("User updated successfully!");
+        // Log user update (best-effort)
+        try {
+          await activityLogService.log({
+            userId: userData?.userId || null,
+            userName: userData?.name || userData?.email || "Unknown User",
+            businessId: formData.businessId || userData?.businessId || null,
+            branchId: formData.branchId || null,
+            actionType: "user_updated",
+            details: `User "${formData.name}" (${formData.email}) updated by ${userData?.name || userData?.email}.`,
+            status: "success",
+          });
+        } catch (logError) {
+          console.error("Failed to log user update activity:", logError);
+        }
       } else {
         // Store current admin user's email before creating new user
         const currentUser = auth.currentUser;
@@ -132,6 +170,21 @@ export default function UserManagement() {
           defaultPassword: true,
           createdBy: userData?.userId,
         });
+
+        // Log user creation (best-effort)
+        try {
+          await activityLogService.log({
+            userId: userData?.userId || null,
+            userName: userData?.name || userData?.email || "Unknown User",
+            businessId: formData.businessId || userData?.businessId || null,
+            branchId: formData.branchId || null,
+            actionType: "user_created",
+            details: `User "${formData.name}" (${formData.email}) created with role ${formData.role}.`,
+            status: "success",
+          });
+        } catch (logError) {
+          console.error("Failed to log user creation activity:", logError);
+        }
 
         // Sign out the newly created user immediately
         await signOut(auth);
@@ -153,6 +206,20 @@ export default function UserManagement() {
     }
   };
 
+  const loadUserFloatToday = async (user) => {
+    if (!user?.branchId || !user?.userId) {
+      setUserFloatToday(null);
+      return;
+    }
+    try {
+      const today = new Date();
+      const float = await dailyFloatService.getByBranchDateAndUser(user.branchId, today, user.userId);
+      setUserFloatToday(float ? { ...float, isClosed: !!(float.closingPhysicalCash && float.closingPhysicalCash !== "") } : null);
+    } catch {
+      setUserFloatToday(null);
+    }
+  };
+
   const handleEdit = (user) => {
     setEditingUser(user);
     setFormData({
@@ -169,7 +236,14 @@ export default function UserManagement() {
       emergencyContactPhone: user.emergencyContactPhone || "",
       emergencyContactRelationship: user.emergencyContactRelationship || "",
     });
+    setUserFloatToday(null);
     setShowForm(true);
+    if (userData?.role === "it_admin") {
+      if (user?.branchId && user?.userId) loadUserFloatToday(user);
+      if (user?.businessId) {
+        branchService.getByBusinessId(user.businessId).then(setBranches).catch(() => {});
+      }
+    }
   };
 
   const handleSuspend = async (user) => {
@@ -185,6 +259,25 @@ export default function UserManagement() {
     }
   };
 
+  const handleLock = async (user) => {
+    if (!window.confirm(`Lock user "${user.name}"? They will not be able to sign in.`)) return;
+    try {
+      await userService.lock(user.userId);
+      loadUsers();
+    } catch (e) {
+      alert(e.message);
+    }
+  };
+
+  const handleUnlock = async (user) => {
+    try {
+      await userService.unlock(user.userId);
+      loadUsers();
+    } catch (e) {
+      alert(e.message);
+    }
+  };
+
   const handleResetPassword = async (user) => {
     if (window.confirm("Reset password to default (AFB12345)?")) {
       try {
@@ -196,22 +289,54 @@ export default function UserManagement() {
     }
   };
 
+  const handleUnlockUserFloat = async () => {
+    if (!editingUser || !userFloatToday?.floatId || userFloatToday?.unlockedByItAdmin) return;
+    setUnlockingFloat(true);
+    try {
+      await dailyFloatService.update(userFloatToday.floatId, { unlockedByItAdmin: true });
+      await loadUserFloatToday(editingUser);
+    } catch (e) {
+      alert("Failed to unlock float: " + e.message);
+    } finally {
+      setUnlockingFloat(false);
+    }
+  };
+
+  const handleUnlockAllBranchFloatsToday = async () => {
+    if (!editingUser?.branchId || userData?.role !== "it_admin") return;
+    if (!window.confirm("Unlock today's float for all users in this branch? They will be able to continue transactions.")) return;
+    setUnlockingFloat(true);
+    try {
+      const floats = await dailyFloatService.getFloatsByBranchAndDate(editingUser.branchId, new Date());
+      const closed = floats.filter((f) => f.closingPhysicalCash && f.closingPhysicalCash !== "" && !f.unlockedByItAdmin);
+      for (const f of closed) {
+        await dailyFloatService.update(f.floatId, { unlockedByItAdmin: true });
+      }
+      if (closed.length) await loadUserFloatToday(editingUser);
+      alert(closed.length ? `Unlocked ${closed.length} float(s).` : "No closed floats to unlock.");
+    } catch (e) {
+      alert("Failed: " + e.message);
+    } finally {
+      setUnlockingFloat(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
-      <div className="flex justify-between items-center">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
-          <h1 className="text-3xl font-bold">User Management</h1>
-          <p className="text-muted-foreground">Manage system users</p>
+          <h1 className="page-title">User Management</h1>
+          <p className="page-description">Manage system users</p>
         </div>
         {!showForm && (
-          <Button onClick={() => setShowForm(true)}>Create New User</Button>
+          <Button onClick={() => setShowForm(true)} className="shrink-0">Create New User</Button>
         )}
       </div>
 
       {showForm && (
         <Card>
-          <CardHeader>
-            <CardTitle>{editingUser ? "Edit User" : "Create New User"}</CardTitle>
+          <CardHeader className="border-b border-border">
+            <CardTitle className="text-xl">{editingUser ? "Edit User" : "Create New User"}</CardTitle>
           </CardHeader>
           <CardContent>
             <form onSubmit={handleSubmit} className="space-y-6">
@@ -385,6 +510,102 @@ export default function UserManagement() {
                 </div>
               </div>
 
+              {userData?.role === "it_admin" && editingUser && (
+                <div className="border-t pt-4">
+                  <h3 className="text-lg font-semibold mb-3 flex items-center gap-2">
+                    <DollarSign className="h-5 w-5" />
+                    Float (today)
+                  </h3>
+                  {!editingUser.branchId ? (
+                    <p className="text-sm text-muted-foreground">User has no branch assigned.</p>
+                  ) : userFloatToday === null ? (
+                    <p className="text-sm text-muted-foreground">Loading…</p>
+                  ) : !userFloatToday.floatId ? (
+                    <p className="text-sm text-muted-foreground">No float opened for today by this user.</p>
+                  ) : (
+                    <div className="flex flex-wrap items-center gap-3">
+                      <span className="text-sm">
+                        Status:{" "}
+                        <Badge variant={userFloatToday.isClosed ? "secondary" : "default"}>
+                          {userFloatToday.isClosed ? "Closed" : "Open"}
+                        </Badge>
+                        {userFloatToday.isClosed && userFloatToday.unlockedByItAdmin && (
+                          <Badge variant="outline" className="ml-1">Unlocked by IT Admin</Badge>
+                        )}
+                      </span>
+                      {userFloatToday.isClosed && !userFloatToday.unlockedByItAdmin && (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          disabled={unlockingFloat}
+                          onClick={handleUnlockUserFloat}
+                        >
+                          {unlockingFloat ? "Unlocking…" : "Unlock this user's float"}
+                        </Button>
+                      )}
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={unlockingFloat}
+                        onClick={handleUnlockAllBranchFloatsToday}
+                        title="Unlock today's float for all users in this branch"
+                      >
+                        {unlockingFloat ? "Unlocking…" : "Unlock all branch floats today"}
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {userData?.role === "it_admin" && editingUser && (
+                <div className="border-t pt-4">
+                  <h3 className="text-lg font-semibold mb-3 flex items-center gap-2">
+                    <KeyRound className="h-5 w-5" />
+                    Quick actions
+                  </h3>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleLock(editingUser)}
+                      disabled={editingUser.status === "locked"}
+                    >
+                      <Lock className="h-3.5 w-3.5 mr-1" />
+                      Lock user
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleUnlock(editingUser)}
+                      disabled={editingUser.status !== "locked"}
+                    >
+                      <Unlock className="h-3.5 w-3.5 mr-1" />
+                      Unlock user
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleSuspend(editingUser)}
+                    >
+                      {editingUser.status === "active" ? (
+                        <><UserX className="h-3.5 w-3.5 mr-1" /> Suspend</>
+                      ) : (
+                        <><UserCheck className="h-3.5 w-3.5 mr-1" /> Reactivate</>
+                      )}
+                    </Button>
+                    <Button type="button" variant="outline" size="sm" onClick={() => handleResetPassword(editingUser)}>
+                      <RotateCcw className="h-3.5 w-3.5 mr-1" />
+                      Reset password
+                    </Button>
+                  </div>
+                </div>
+              )}
+
               <div className="flex justify-end gap-4">
                 <Button type="button" variant="outline" onClick={resetForm}>
                   Cancel
@@ -399,10 +620,46 @@ export default function UserManagement() {
       )}
 
       <Card>
-        <CardHeader>
-          <CardTitle>All Users</CardTitle>
+        <CardHeader className="border-b border-border">
+          <CardTitle className="text-xl">All Users</CardTitle>
         </CardHeader>
         <CardContent>
+          {userData?.role === "it_admin" && (
+            <div className="flex flex-wrap gap-4 mb-4">
+              <div className="space-y-1">
+                <Label className="text-xs">Filter by Business</Label>
+                <Select
+                  value={filterBusinessId}
+                  onChange={(e) => {
+                    setFilterBusinessId(e.target.value);
+                    setFilterBranchId("");
+                  }}
+                >
+                  <option value="">All businesses</option>
+                  {businesses.map((b) => (
+                    <option key={b.businessId} value={b.businessId}>
+                      {b.businessName}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs">Filter by Branch</Label>
+                <Select
+                  value={filterBranchId}
+                  onChange={(e) => setFilterBranchId(e.target.value)}
+                  disabled={!filterBusinessId}
+                >
+                  <option value="">All branches</option>
+                  {filterBranches.map((b) => (
+                    <option key={b.branchId} value={b.branchId}>
+                      {b.branchName}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+            </div>
+          )}
           <Table>
             <TableHeader>
               <TableRow>
@@ -436,48 +693,60 @@ export default function UserManagement() {
                         variant={
                           user.status === "active"
                             ? "default"
-                            : user.status === "suspended"
+                            : user.status === "locked" || user.status === "suspended"
                             ? "destructive"
                             : "secondary"
                         }
                       >
-                        {user.status}
+                        {user.status || "active"}
                       </Badge>
                     </TableCell>
                     <TableCell>
                       {user.lastLogin
-                        ? new Date(user.lastLogin.toDate()).toLocaleDateString()
+                        ? new Date(user.lastLogin.toDate ? user.lastLogin.toDate() : user.lastLogin).toLocaleDateString()
                         : "Never"}
                     </TableCell>
                     <TableCell>
-                      <div className="flex gap-2">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => handleEdit(user)}
-                          title="Edit"
-                        >
-                          <Edit className="h-4 w-4" />
+                      <div className="flex gap-2 flex-wrap items-center">
+                        <Button variant="outline" size="sm" className="h-8" onClick={() => handleEdit(user)} title="Edit">
+                          <Edit className="h-3.5 w-3.5 mr-1" />
+                          Edit
                         </Button>
                         <Button
-                          variant="ghost"
+                          variant="outline"
                           size="sm"
+                          className="h-8"
                           onClick={() => handleSuspend(user)}
                           title={user.status === "active" ? "Suspend" : "Reactivate"}
                         >
                           {user.status === "active" ? (
-                            <UserX className="h-4 w-4" />
+                            <UserX className="h-3.5 w-3.5 mr-1" />
                           ) : (
-                            <UserCheck className="h-4 w-4" />
+                            <UserCheck className="h-3.5 w-3.5 mr-1" />
                           )}
+                          {user.status === "active" ? "Suspend" : "Reactivate"}
                         </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => handleResetPassword(user)}
-                          title="Reset Password"
-                        >
-                          <RotateCcw className="h-4 w-4" />
+                        {(userData?.role === "it_admin" || userData?.role === "branch_manager") &&
+                          (user.status === "locked" ? (
+                            <Button variant="default" size="sm" className="h-8" onClick={() => handleUnlock(user)} title="Unlock">
+                              <Unlock className="h-3.5 w-3.5 mr-1" />
+                              Unlock
+                            </Button>
+                          ) : (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-8 text-destructive border-destructive hover:bg-destructive/10 hover:text-destructive"
+                              onClick={() => handleLock(user)}
+                              title="Lock"
+                            >
+                              <Lock className="h-3.5 w-3.5 mr-1" />
+                              Lock
+                            </Button>
+                          ))}
+                        <Button variant="outline" size="sm" className="h-8" onClick={() => handleResetPassword(user)} title="Reset Password">
+                          <RotateCcw className="h-3.5 w-3.5 mr-1" />
+                          Reset
                         </Button>
                       </div>
                     </TableCell>

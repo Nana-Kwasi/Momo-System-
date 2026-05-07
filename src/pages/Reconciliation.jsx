@@ -1,7 +1,9 @@
 import React, { useState, useEffect, useRef } from "react";
-import { reconciliationService, transactionService, dailyFloatService } from "../services/firestoreService";
+import { reconciliationService, transactionService, dailyFloatService, activityLogService, topUpService } from "../services/firestoreService";
 import { merchantSimService } from "../services/merchantSimService";
 import { useAuth } from "../context/AuthContext";
+import { collection, query, where, getDocs } from "firebase/firestore";
+import { db } from "../lib/firebase";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
@@ -18,6 +20,8 @@ export default function Reconciliation() {
   const [merchantSims, setMerchantSims] = useState([]);
   const [showAddMerchantSim, setShowAddMerchantSim] = useState({ provider: "", visible: false });
   const [newMerchantSim, setNewMerchantSim] = useState({ provider: "", simName: "", agentNumber: "" });
+  const [isFloatClosedToday, setIsFloatClosedToday] = useState(false);
+  const [currentFloatId, setCurrentFloatId] = useState(null);
   const [formData, setFormData] = useState({
     date: new Date().toISOString().split("T")[0], // Always current date, cannot be changed
     systemPhysicalCash: "",
@@ -33,6 +37,8 @@ export default function Reconciliation() {
     // Store merchant SIM balances
     systemMerchantSimEcash: {},
     actualMerchantSimEcash: {},
+    systemBankBalances: {},
+    actualBankBalances: {},
     varianceExplanation: "",
     physicalCashVarianceReason: "",
     mtnVarianceReason: "",
@@ -62,8 +68,9 @@ export default function Reconciliation() {
   const loadMerchantSims = async () => {
     try {
       const branchId = selectedBranchId || userData?.branchId;
-      if (!branchId) return;
-      const sims = await merchantSimService.getByBranch(branchId);
+      const businessId = selectedBusinessId || userData?.businessId;
+      if (!branchId && !businessId) return;
+      const sims = await merchantSimService.getByBranch(branchId, businessId);
       setMerchantSims(sims);
     } catch (error) {
       console.error("Error loading merchant SIMs:", error);
@@ -83,6 +90,7 @@ export default function Reconciliation() {
       }
       await merchantSimService.create({
         branchId,
+        businessId: selectedBusinessId || userData?.businessId,
         provider: newMerchantSim.provider,
         simName: newMerchantSim.simName,
         agentNumber: newMerchantSim.agentNumber,
@@ -150,7 +158,7 @@ export default function Reconciliation() {
       let dataFound = false;
       
       try {
-        const floatPromise = dailyFloatService.getByBranchAndDate(branchId, todayDate);
+        const floatPromise = dailyFloatService.getByBranchDateAndUser(branchId, todayDate, userData?.userId);
         float = await Promise.race([floatPromise, timeoutPromise]);
       if (float) {
           dataFound = true;
@@ -162,6 +170,7 @@ export default function Reconciliation() {
       
       if (!float) {
         // No float for today, clear system balances and stop loading immediately
+        setIsFloatClosedToday(false);
         stopLoading();
         setFormData((prev) => ({
           ...prev,
@@ -176,6 +185,15 @@ export default function Reconciliation() {
         if (loadTimestampRef.current === loadTimestamp) {
           setNoDataMessage("No opening float found for today. Please create an opening float first.");
         }
+        return;
+      }
+
+      const isClosed = float.closingPhysicalCash && float.closingPhysicalCash !== "";
+      const unlockedByItAdmin = float.unlockedByItAdmin === true;
+      setIsFloatClosedToday(isClosed && !unlockedByItAdmin);
+      setCurrentFloatId(float.floatId || null);
+      if (isClosed && !unlockedByItAdmin) {
+        stopLoading();
         return;
       }
 
@@ -217,17 +235,25 @@ export default function Reconciliation() {
         transactions = { momo: [], bank: [] };
       }
       
-      // Start with opening float balances
-        let physicalCash = parseFloat(float.openingPhysicalCash || 0);
-      
-      // Initialize merchant SIM balances from opening float
+      let physicalCash = parseFloat(float.openingPhysicalCash || 0);
       const merchantSimBalances = {};
       if (float.openingMerchantSimEcash && typeof float.openingMerchantSimEcash === 'object') {
         Object.keys(float.openingMerchantSimEcash).forEach(simId => {
           merchantSimBalances[simId] = parseFloat(float.openingMerchantSimEcash[simId] || 0);
         });
       }
-      
+      const merchantSimPhysicalCash = {};
+      if (float.openingMerchantSimPhysicalCash && typeof float.openingMerchantSimPhysicalCash === 'object') {
+        Object.keys(float.openingMerchantSimPhysicalCash).forEach(simId => {
+          merchantSimPhysicalCash[simId] = parseFloat(float.openingMerchantSimPhysicalCash[simId] || 0);
+        });
+      }
+      const bankBalances = {};
+      if (float.openingBankBalances && typeof float.openingBankBalances === 'object') {
+        Object.keys(float.openingBankBalances).forEach(name => {
+          bankBalances[name] = parseFloat(float.openingBankBalances[name] || 0);
+        });
+      }
       // Fallback to provider-level balances if merchant SIM data not available
         let mtnEcash = parseFloat(float.openingMtnEcash || 0);
         let vodafoneEcash = parseFloat(float.openingVodafoneEcash || 0);
@@ -248,30 +274,33 @@ export default function Reconciliation() {
           
           console.log(`Processing MoMo transaction: ${t.transactionType} ${t.provider} ${t.merchantSimName || ''} GHS ${amount} | Date: ${t.date}`);
           
-          // Cash In: Customer gives physical cash → Agent credits customer E-Cash
-          // Physical Cash increases, E-Cash decreases
-          if (t.transactionType === "cash_in") {
-            physicalCash += amount; // Agent receives physical cash
-            // If transaction has merchant SIM, update that specific SIM balance
+          const simHasPhysicalFloat = (simId) => float.openingMerchantSimPhysicalCash != null && typeof float.openingMerchantSimPhysicalCash === "object" && float.openingMerchantSimPhysicalCash[simId] != null;
+          if (t.transactionType === "cash_in" || t.transactionType === "deposit") {
+            if (t.merchantSimId && simHasPhysicalFloat(t.merchantSimId)) {
+              if (merchantSimPhysicalCash[t.merchantSimId] === undefined) merchantSimPhysicalCash[t.merchantSimId] = parseFloat(float.openingMerchantSimPhysicalCash?.[t.merchantSimId] || 0);
+              merchantSimPhysicalCash[t.merchantSimId] += amount;
+            } else {
+              physicalCash += amount;
+            }
             if (t.merchantSimId && merchantSimBalances.hasOwnProperty(t.merchantSimId)) {
               merchantSimBalances[t.merchantSimId] -= amount;
             } else {
-              // Fallback to provider-level tracking
-            if (t.provider === "MTN") mtnEcash -= amount;
-            else if (t.provider === "Vodafone") vodafoneEcash -= amount;
-            else if (t.provider === "AirtelTigo") airtelTigoEcash -= amount;
-            else if (t.provider === "Telecel") telecelEcash -= amount;
+              if (t.provider === "MTN") mtnEcash -= amount;
+              else if (t.provider === "Vodafone") vodafoneEcash -= amount;
+              else if (t.provider === "AirtelTigo") airtelTigoEcash -= amount;
+              else if (t.provider === "Telecel") telecelEcash -= amount;
             }
-          } 
-          // Cash Out: Customer receives physical cash → Customer credits agent E-Cash
-          // Physical Cash decreases, E-Cash increases
-          else if (t.transactionType === "cash_out") {
-            physicalCash -= amount; // Agent gives physical cash
-            // If transaction has merchant SIM, update that specific SIM balance
+          } else if (t.transactionType === "cash_out") {
+            const useSimFloat = t.physicalCashSource === "sim_float" || (t.physicalCashSource !== "branch_opening" && t.merchantSimId && simHasPhysicalFloat(t.merchantSimId));
+            if (useSimFloat && t.merchantSimId && simHasPhysicalFloat(t.merchantSimId)) {
+              if (merchantSimPhysicalCash[t.merchantSimId] === undefined) merchantSimPhysicalCash[t.merchantSimId] = parseFloat(float.openingMerchantSimPhysicalCash?.[t.merchantSimId] || 0);
+              merchantSimPhysicalCash[t.merchantSimId] -= amount;
+            } else {
+              physicalCash -= amount;
+            }
             if (t.merchantSimId && merchantSimBalances.hasOwnProperty(t.merchantSimId)) {
               merchantSimBalances[t.merchantSimId] += amount;
             } else {
-              // Fallback to provider-level tracking
               if (t.provider === "MTN") mtnEcash += amount;
               else if (t.provider === "Vodafone") vodafoneEcash += amount;
               else if (t.provider === "AirtelTigo") airtelTigoEcash += amount;
@@ -289,20 +318,131 @@ export default function Reconciliation() {
             console.warn("Skipping invalid bank transaction:", t);
             return;
           }
-          
-          console.log(`Processing bank transaction: ${t.transactionType} ${t.bankName || ''} GHS ${amount} | Date: ${t.date}`);
-          
-          // Deposit: Customer deposits money into bank account → Agent receives physical cash
-          // Physical Cash increases
-          if (t.transactionType === "deposit") {
-            physicalCash += amount; // Agent receives physical cash
-          } 
-          // Withdrawal: Customer withdraws money from bank account → Agent gives physical cash
-          // Physical Cash decreases
-          else if (t.transactionType === "withdrawal") {
-            physicalCash -= amount; // Agent gives physical cash
+          const bankName = t.bankName;
+          if (bankName) {
+            if (bankBalances[bankName] === undefined) bankBalances[bankName] = 0;
+            if (t.transactionType === "deposit") bankBalances[bankName] += amount;
+            else if (t.transactionType === "withdrawal") bankBalances[bankName] -= amount;
+          }
+          if (t.transactionType === "deposit") physicalCash += amount;
+          else if (t.transactionType === "withdrawal") physicalCash -= amount;
+        });
+      }
+      
+      // Process SIM Sales (both regular SIM sales and airtime sales)
+      try {
+        // today is already a string in format "YYYY-MM-DD"
+        const isAdmin = userData?.role === "admin" || userData?.role === "branch_manager" || userData?.role === "it_admin";
+        
+        let simSalesQuery = query(
+          collection(db, "sim_sales"),
+          where("branchId", "==", branchId),
+          where("date", "==", today)
+        );
+        
+        // If user is not admin, filter by recordedBy
+        if (!isAdmin && userData?.userId) {
+          simSalesQuery = query(
+            collection(db, "sim_sales"),
+            where("branchId", "==", branchId),
+            where("date", "==", today),
+            where("recordedBy", "==", userData.userId)
+          );
+        }
+        
+        const simSalesSnapshot = await getDocs(simSalesQuery).catch(() => ({ docs: [] }));
+        const simSales = simSalesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        
+        simSales.forEach((sale) => {
+          // Regular SIM Sales: Increase physical cash
+          if (!sale.saleType || sale.saleType === "sim_sale") {
+            const totalAmount = parseFloat(sale.totalAmount || 0);
+            if (!isNaN(totalAmount) && totalAmount > 0 && sale.paymentMethod === "cash") {
+              physicalCash += totalAmount; // SIM sales increase physical cash
+              console.log(`Processing SIM sale: GHS ${totalAmount} | Physical cash increased`);
+            }
+          } else if (sale.saleType === "bundle") {
+            const amount = parseFloat(sale.amount || sale.totalAmount || 0);
+            if (!isNaN(amount) && amount > 0) {
+              physicalCash += amount;
+              if (sale.merchantSimId && merchantSimBalances.hasOwnProperty(sale.merchantSimId)) {
+                merchantSimBalances[sale.merchantSimId] -= amount;
+              }
+            }
+          } else if (sale.saleType === "airtime") {
+            const price = parseFloat(sale.price || 0);
+            if (!isNaN(price) && price > 0) {
+              console.log(`Processing Airtime sale: ${sale.provider} ${sale.merchantSimName || ''} GHS ${price} | Merchant SIM: ${sale.merchantSimId}`);
+              
+              // Decrease E-Cash for the merchant SIM
+              if (sale.merchantSimId && merchantSimBalances.hasOwnProperty(sale.merchantSimId)) {
+                merchantSimBalances[sale.merchantSimId] -= price;
+                console.log(`Airtime: Decreased E-Cash for merchant SIM ${sale.merchantSimId} by ${price}`);
+              } else {
+                // Fallback to provider-level tracking
+                if (sale.provider === "MTN") mtnEcash -= price;
+                else if (sale.provider === "Vodafone") vodafoneEcash -= price;
+                else if (sale.provider === "AirtelTigo") airtelTigoEcash -= price;
+                console.log(`Airtime: Decreased ${sale.provider} E-Cash by ${price}`);
+              }
+              
+              // If paid in cash, increase physical cash
+              if (sale.paymentMethod === "cash") {
+                physicalCash += price;
+                console.log(`Airtime: Increased physical cash by ${price} (paid in cash)`);
+              }
+            }
           }
         });
+      } catch (error) {
+        console.error("Error loading SIM sales:", error);
+      }
+
+      // Process top-ups for today
+      try {
+        const topUps = await topUpService.getByBranchAndDate(branchId, todayDate);
+        topUps.forEach((topUp) => {
+          const amount = parseFloat(topUp.amount || 0);
+          if (isNaN(amount) || amount <= 0) return;
+
+          if (topUp.topUpType === "physical_cash") {
+            physicalCash += amount;
+            console.log(`Reconciliation: Added physical cash top-up: GHS ${amount}`);
+          } else if (topUp.topUpType === "merchant_sim_ecash" && topUp.merchantSimId) {
+            if (merchantSimBalances.hasOwnProperty(topUp.merchantSimId)) {
+              merchantSimBalances[topUp.merchantSimId] += amount;
+            } else {
+              merchantSimBalances[topUp.merchantSimId] = amount;
+            }
+          } else if (topUp.topUpType === "sim_to_sim" && topUp.fromMerchantSimId && topUp.toMerchantSimId) {
+            const amt = parseFloat(topUp.amount || 0);
+            if (merchantSimBalances.hasOwnProperty(topUp.fromMerchantSimId)) merchantSimBalances[topUp.fromMerchantSimId] -= amt;
+            if (merchantSimBalances.hasOwnProperty(topUp.toMerchantSimId)) merchantSimBalances[topUp.toMerchantSimId] += amt;
+          } else if (topUp.topUpType === "bank_to_sim" && topUp.merchantSimId) {
+            if (merchantSimBalances.hasOwnProperty(topUp.merchantSimId)) merchantSimBalances[topUp.merchantSimId] += amount;
+            else merchantSimBalances[topUp.merchantSimId] = amount;
+          } else if (topUp.topUpType === "sim_to_bank" && topUp.fromMerchantSimId) {
+            const amt = parseFloat(topUp.amount || 0);
+            if (merchantSimBalances.hasOwnProperty(topUp.fromMerchantSimId)) {
+              merchantSimBalances[topUp.fromMerchantSimId] -= amt;
+            }
+            if (topUp.bankName) {
+              if (bankBalances[topUp.bankName] === undefined) bankBalances[topUp.bankName] = 0;
+              bankBalances[topUp.bankName] += amt;
+            }
+          } else if (topUp.topUpType === "bank_to_sim" && topUp.bankName) {
+            if (bankBalances[topUp.bankName] === undefined) bankBalances[topUp.bankName] = 0;
+            bankBalances[topUp.bankName] -= amount;
+          } else if (topUp.topUpType === "sim_to_bank_physical" && topUp.bankName) {
+            if (bankBalances[topUp.bankName] === undefined) bankBalances[topUp.bankName] = 0;
+            bankBalances[topUp.bankName] += parseFloat(topUp.amount || 0);
+          } else if (topUp.topUpType === "bank_to_sim_physical" && topUp.bankName) {
+            if (bankBalances[topUp.bankName] === undefined) bankBalances[topUp.bankName] = 0;
+            bankBalances[topUp.bankName] -= parseFloat(topUp.amount || 0);
+          }
+        });
+      } catch (error) {
+        console.error("Error loading top-ups:", error);
       }
       
       console.log("Reconciliation: Final calculated balances - Physical:", physicalCash, "Merchant SIMs:", merchantSimBalances);
@@ -315,9 +455,11 @@ export default function Reconciliation() {
       Object.keys(merchantSimBalances).forEach(simId => {
         formattedMerchantSimBalances[simId] = roundTo2(merchantSimBalances[simId]).toFixed(2);
       });
+      const formattedBankBalances = {};
+      Object.keys(bankBalances).forEach(name => {
+        formattedBankBalances[name] = roundTo2(bankBalances[name]).toFixed(2);
+      });
 
-      // Use functional update to ensure we're updating with latest calculated values
-      // Don't preserve old values - completely replace system balances
       const newSystemBalances = {
         systemPhysicalCash: roundTo2(physicalCash).toFixed(2),
         systemMtnEcash: roundTo2(mtnEcash).toFixed(2),
@@ -325,6 +467,7 @@ export default function Reconciliation() {
         systemAirtelTigoEcash: roundTo2(airtelTigoEcash).toFixed(2),
         systemTelecelEcash: roundTo2(telecelEcash).toFixed(2),
         systemMerchantSimEcash: formattedMerchantSimBalances,
+        systemBankBalances: formattedBankBalances,
       };
       
       console.log("Reconciliation: Setting new balances:", newSystemBalances);
@@ -361,7 +504,7 @@ export default function Reconciliation() {
           }
           return;
         }
-        const float = await dailyFloatService.getByBranchAndDate(branchId, todayDate);
+        const float = await dailyFloatService.getByBranchDateAndUser(branchId, todayDate, userData?.userId);
         if (float) {
           const merchantSimBalances = {};
           if (float.openingMerchantSimEcash && typeof float.openingMerchantSimEcash === 'object') {
@@ -466,9 +609,27 @@ export default function Reconciliation() {
         totalVariance,
         reconciledBy: userData.userId,
         reconciledByName: userData.name || userData.email,
+        floatId: currentFloatId || null,
         status,
       });
       alert("Reconciliation recorded successfully!");
+
+      // Log reconciliation submission (best-effort)
+      try {
+        await activityLogService.log({
+          userId: userData?.userId || null,
+          userName: userData?.name || userData?.email || "Unknown User",
+          businessId,
+          branchId,
+          actionType: "reconciliation_submitted",
+          details: `Reconciliation for ${formData.date} submitted with total variance GHS ${totalVariance.toFixed(
+            2
+          )}. Status: ${status}.`,
+          status: "success",
+        });
+      } catch (logError) {
+        console.error("Failed to log reconciliation submission activity:", logError);
+      }
       setFormData({
         date: new Date().toISOString().split("T")[0],
         systemPhysicalCash: "",
@@ -481,6 +642,10 @@ export default function Reconciliation() {
         actualAirtelTigoEcash: "",
         systemTelecelEcash: "",
         actualTelecelEcash: "",
+        systemMerchantSimEcash: {},
+        actualMerchantSimEcash: {},
+        systemBankBalances: {},
+        actualBankBalances: {},
         varianceExplanation: "",
         status: "pending",
       });
@@ -497,6 +662,23 @@ export default function Reconciliation() {
 
   return (
     <div className="space-y-6 relative">
+      {/* Block UI if float is closed for today */}
+      {isFloatClosedToday && (
+        <div className="absolute inset-0 bg-white/90 backdrop-blur-sm z-40 flex items-center justify-center pointer-events-auto">
+          <Card className="w-full max-w-md mx-4 pointer-events-auto">
+            <CardContent className="pt-6">
+              <div className="text-center space-y-4">
+                <div className="text-6xl">🔒</div>
+                <h2 className="text-2xl font-bold">Day Closed</h2>
+                <p className="text-muted-foreground">
+                  Today's float has been closed. All activities are locked until a new day begins.
+                </p>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+      
       {/* Loading Overlay */}
       {loadingBalances && (
         <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center">
@@ -511,7 +693,7 @@ export default function Reconciliation() {
       )}
 
       <div>
-        <h1 className="text-3xl font-bold">Daily Reconciliation</h1>
+        <h1 className="page-title">Daily Reconciliation</h1>
         <p className="text-muted-foreground">Reconcile system balances with actual counts</p>
         {!isToday && (
           <div className="mt-2 p-3 bg-yellow-50 border border-yellow-200 rounded-md">
@@ -638,7 +820,7 @@ export default function Reconciliation() {
 
             <div className="border-t pt-4">
               <h3 className="text-lg font-semibold mb-4">E-Cash Reconciliation</h3>
-              {["MTN", "Vodafone", "AirtelTigo", "Telecel"].map((provider) => {
+              {["MTN", "AirtelTigo", "Telecel"].map((provider) => {
                 const providerSims = merchantSims.filter(sim => sim.provider === provider);
                 return (
                   <div key={provider} className="mb-6 border rounded-md p-4">
@@ -790,6 +972,55 @@ export default function Reconciliation() {
                 );
               })}
             </div>
+
+            {/* Bank Balances – includes banks with no opening float (e.g. received SIM→Bank transfer) */}
+            {formData.systemBankBalances && typeof formData.systemBankBalances === "object" && Object.keys(formData.systemBankBalances).length > 0 && (
+              <div className="border-t pt-4">
+                <h3 className="text-lg font-semibold mb-4">Bank Balances (GHS)</h3>
+                <p className="text-sm text-muted-foreground mb-3">Banks that had activity (opening, transactions, or SIM↔Bank transfers). Enter actual balance for each.</p>
+                <div className="grid gap-4 md:grid-cols-2">
+                  {Object.keys(formData.systemBankBalances).map((bankName) => {
+                    const systemValue = formData.systemBankBalances[bankName] || "0.00";
+                    const actualValue = formData.actualBankBalances?.[bankName] ?? "";
+                    const variance = calculateVariance(systemValue, actualValue);
+                    return (
+                      <div key={bankName} className="border rounded-md p-3">
+                        <h5 className="font-medium mb-2">{bankName}</h5>
+                        <div className="grid gap-4 md:grid-cols-2">
+                          <div className="space-y-2">
+                            <Label>System Balance (GHS)</Label>
+                            <Input type="text" value={systemValue} readOnly className="bg-muted" />
+                          </div>
+                          <div className="space-y-2">
+                            <Label>Actual Balance (GHS)</Label>
+                            <Input
+                              type="text"
+                              inputMode="decimal"
+                              value={actualValue}
+                              onChange={(e) => {
+                                const value = e.target.value.replace(/[^0-9.]/g, '');
+                                setFormData({ ...formData, actualBankBalances: { ...formData.actualBankBalances, [bankName]: value } });
+                              }}
+                              onBlur={(e) => {
+                                const num = parseFloat(e.target.value);
+                                if (!isNaN(num)) {
+                                  setFormData({ ...formData, actualBankBalances: { ...formData.actualBankBalances, [bankName]: num.toFixed(2) } });
+                                }
+                              }}
+                            />
+                          </div>
+                        </div>
+                        <p className="text-sm mt-2">
+                          Difference: <span className={Math.abs(variance) > 0.02 ? "text-red-600 font-bold" : "text-green-600"}>
+                            GHS {variance >= 0 ? `+${variance.toFixed(2)}` : variance.toFixed(2)}
+                          </span>
+                        </p>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
 
             {/* Only show variance section if all values are entered and there's a difference */}
             {hasVariance && (

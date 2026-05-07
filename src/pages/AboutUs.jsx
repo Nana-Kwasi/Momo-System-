@@ -49,7 +49,7 @@ export default function AboutUs() {
               <li>Real-time transaction recording and tracking</li>
               <li>Comprehensive float management (opening and closing)</li>
               <li>Automated daily reconciliation</li>
-              <li>Multi-provider support (MTN, Vodafone, AirtelTigo, Telecel)</li>
+              <li>Multi-provider support (MTN, AirtelTigo, Telecel)</li>
               <li>Merchant SIM management for multiple accounts</li>
               <li>Role-based access control for secure operations</li>
               <li>Detailed reporting and analytics</li>

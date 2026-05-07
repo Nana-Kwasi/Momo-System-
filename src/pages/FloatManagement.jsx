@@ -1,8 +1,10 @@
 import React, { useState, useEffect, useRef } from "react";
-import { dailyFloatService, transactionService } from "../services/firestoreService";
+import { dailyFloatService, transactionService, activityLogService, topUpService, bankService } from "../services/firestoreService";
 import { merchantSimService } from "../services/merchantSimService";
 import { useAuth } from "../context/AuthContext";
 import { Timestamp } from "firebase/firestore";
+import { collection, query, where, getDocs } from "firebase/firestore";
+import { db } from "../lib/firebase";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
@@ -10,7 +12,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
 import { Badge } from "../components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { Select } from "../components/ui/select";
-import { AlertCircle, CheckCircle, XCircle, Plus } from "lucide-react";
+import { AlertCircle, CheckCircle, XCircle, Plus, ArrowUpCircle } from "lucide-react";
+import TopUpModal from "../components/TopUpModal";
 
 export default function FloatManagement() {
   const { userData, selectedBusinessId, selectedBranchId } = useAuth();
@@ -26,12 +29,23 @@ export default function FloatManagement() {
     vodafoneEcash: 0,
     airtelTigoEcash: 0,
     telecelEcash: 0,
-    merchantSimEcash: {}, // Track balances per merchant SIM
+    merchantSimEcash: {},
+    merchantSimPhysicalCash: {},
+    bankBalances: {},
   });
   const [merchantSims, setMerchantSims] = useState([]);
   const [showAddMerchantSim, setShowAddMerchantSim] = useState({ provider: "", visible: false });
   const [newMerchantSim, setNewMerchantSim] = useState({ provider: "", simName: "", agentNumber: "" });
-  const [banks] = useState(["Ecobank", "Fidelity", "First Bank", "GCB", "Others"]);
+  const [banks, setBanks] = useState([]);
+  const [pendingFloats, setPendingFloats] = useState([]);
+  const [showPendingFloatsModal, setShowPendingFloatsModal] = useState(false);
+  const [selectedPendingFloat, setSelectedPendingFloat] = useState(null);
+  const [showCloseFloatModal, setShowCloseFloatModal] = useState(false);
+  const [showGoodEveningModal, setShowGoodEveningModal] = useState(false);
+  const [showGoodMorningModal, setShowGoodMorningModal] = useState(false);
+  const [isFloatClosedToday, setIsFloatClosedToday] = useState(false);
+  const [closedFloatIdForUnlock, setClosedFloatIdForUnlock] = useState(null);
+  const [showTopUpModal, setShowTopUpModal] = useState(false);
   const [formData, setFormData] = useState({
     date: new Date().toISOString().split("T")[0],
     time: new Date().toLocaleTimeString(),
@@ -40,8 +54,8 @@ export default function FloatManagement() {
     openingVodafoneEcash: "",
     openingAirtelTigoEcash: "",
     openingTelecelEcash: "",
-    // Store e-cash per merchant SIM as object: { merchantSimId: value }
     openingMerchantSimEcash: {},
+    openingMerchantSimPhysicalCash: {},
     floatReceivedFromHQ: "",
     floatReceivedFromBank: "",
     receivedBy: "",
@@ -52,8 +66,11 @@ export default function FloatManagement() {
     closingAirtelTigoEcash: "",
     closingTelecelEcash: "",
     closingMerchantSimEcash: {},
+    closingMerchantSimPhysicalCash: {},
+    closingBankBalances: {},
     variance: "",
     varianceReason: "",
+    openingBankBalances: {},
     // Store bank transactions as array: [{ bankName, transactionType, amount }, ...]
     cashBanked: [],
     ecashSentToHQ: "",
@@ -72,15 +89,46 @@ export default function FloatManagement() {
       loadMerchantSims();
       loadTodayFloat();
       loadFloatHistory();
+      loadPendingFloats();
     }
   }, [branchId]);
 
-  // Calculate expected balances when todayFloat is loaded
   useEffect(() => {
-    if (todayFloat && branchId) {
+    if (businessId) {
+      bankService.getByBusinessId(businessId).then(setBanks).catch(() => setBanks([]));
+    }
+  }, [businessId]);
+
+  // Calculate expected balances when todayFloat or selectedPendingFloat is loaded
+  useEffect(() => {
+    if ((todayFloat || selectedPendingFloat) && branchId) {
       calculateExpectedBalances();
     }
-  }, [todayFloat, branchId]);
+  }, [todayFloat, selectedPendingFloat, branchId]);
+
+  // Show pending floats modal only when there are unclosed floats from previous days (not today)
+  useEffect(() => {
+    if (pendingFloats.length > 0) {
+      const today = new Date().toISOString().split("T")[0];
+      
+      // Filter pending floats to only include those from previous days (not today)
+      const previousDayFloats = pendingFloats.filter(f => {
+        const floatDate = f.date?.toDate ? f.date.toDate().toISOString().split("T")[0] : 
+                         (typeof f.date === 'string' ? f.date : new Date(f.date).toISOString().split("T")[0]);
+        return floatDate !== today;
+      });
+      
+      // Only show modal if there are pending floats from previous days
+      if (previousDayFloats.length > 0) {
+        setShowPendingFloatsModal(true);
+      } else {
+        // If all pending floats are from today, don't show the modal
+        setShowPendingFloatsModal(false);
+      }
+    } else {
+      setShowPendingFloatsModal(false);
+    }
+  }, [pendingFloats]);
 
   // Auto-populate closing form with expected balances when mode changes to closing and expected balances are ready
   useEffect(() => {
@@ -106,18 +154,20 @@ export default function FloatManagement() {
           });
         }
         
+        const closingBankBalances = {};
+        if (expectedBalances.bankBalances && typeof expectedBalances.bankBalances === "object") {
+          Object.keys(expectedBalances.bankBalances).forEach((name) => {
+            const v = expectedBalances.bankBalances[name];
+            if (v !== undefined && v !== null && !isNaN(v)) closingBankBalances[name] = parseFloat(v).toFixed(2);
+          });
+        }
         setFormData(prev => {
-          // Always update to match expected balances from reconciliation
           const newData = {
             ...prev,
             closingPhysicalCash: expectedBalances.physicalCash.toFixed(2),
             closingMerchantSimEcash: { ...prev.closingMerchantSimEcash, ...merchantSimEcash },
+            closingBankBalances: { ...prev.closingBankBalances, ...closingBankBalances },
           };
-          console.log("Auto-populating closing form:", {
-            physicalCash: newData.closingPhysicalCash,
-            merchantSimEcash: newData.closingMerchantSimEcash,
-            expectedBalances
-          });
           return newData;
         });
       }
@@ -126,7 +176,7 @@ export default function FloatManagement() {
 
   const loadMerchantSims = async () => {
     try {
-      const sims = await merchantSimService.getByBranch(branchId);
+      const sims = await merchantSimService.getByBranch(branchId, businessId);
       setMerchantSims(sims);
     } catch (error) {
       console.error("Error loading merchant SIMs:", error);
@@ -141,6 +191,7 @@ export default function FloatManagement() {
     try {
       await merchantSimService.create({
         branchId: branchId,
+        businessId,
         provider: newMerchantSim.provider,
         simName: newMerchantSim.simName,
         agentNumber: newMerchantSim.agentNumber,
@@ -174,68 +225,110 @@ export default function FloatManagement() {
   const calculateExpectedBalances = async () => {
     try {
       if (!branchId) return;
-      const today = new Date();
+      const floatToUse = selectedPendingFloat || todayFloat;
+      if (!floatToUse) return;
+      
+      // Get the date from the float (could be today or a previous day)
+      const floatDate = floatToUse.date?.toDate ? floatToUse.date.toDate() : new Date(floatToUse.date);
+      const dateString = floatDate.toISOString().split("T")[0];
+      
       // For float management, admins should see ALL branch transactions
       const isAdmin = userData?.role === "admin" || userData?.role === "branch_manager" || userData?.role === "it_admin";
+      
+      // Get all transactions (we'll filter by date)
       const transactions = await transactionService.getTodayTransactions(
         branchId, 
         isAdmin ? null : userData?.userId, 
         isAdmin ? "admin" : userData?.role
       );
       
-      // Initialize merchant SIM balances from opening float
+      // Filter transactions by the float's date
+      const filteredTransactions = {
+        momo: (transactions.momo || []).filter(t => {
+          const tDate = t.date?.toDate ? t.date.toDate().toISOString().split("T")[0] : (typeof t.date === 'string' ? t.date : new Date(t.date).toISOString().split("T")[0]);
+          return tDate === dateString;
+        }),
+        bank: (transactions.bank || []).filter(t => {
+          const tDate = t.date?.toDate ? t.date.toDate().toISOString().split("T")[0] : (typeof t.date === 'string' ? t.date : new Date(t.date).toISOString().split("T")[0]);
+          return tDate === dateString;
+        }),
+      };
+      
       const merchantSimBalances = {};
-      if (todayFloat?.openingMerchantSimEcash && typeof todayFloat.openingMerchantSimEcash === 'object') {
-        Object.keys(todayFloat.openingMerchantSimEcash).forEach(simId => {
-          merchantSimBalances[simId] = parseFloat(todayFloat.openingMerchantSimEcash[simId] || 0);
+      if (floatToUse?.openingMerchantSimEcash && typeof floatToUse.openingMerchantSimEcash === 'object') {
+        Object.keys(floatToUse.openingMerchantSimEcash).forEach(simId => {
+          merchantSimBalances[simId] = parseFloat(floatToUse.openingMerchantSimEcash[simId] || 0);
         });
       }
-      
-      if (!transactions || (!transactions.momo && !transactions.bank)) {
-        setExpectedBalances({
-          physicalCash: parseFloat(todayFloat?.openingPhysicalCash || 0),
-          mtnEcash: parseFloat(todayFloat?.openingMtnEcash || 0),
-          vodafoneEcash: parseFloat(todayFloat?.openingVodafoneEcash || 0),
-          airtelTigoEcash: parseFloat(todayFloat?.openingAirtelTigoEcash || 0),
-          telecelEcash: parseFloat(todayFloat?.openingTelecelEcash || 0),
-          merchantSimEcash: merchantSimBalances,
+      const merchantSimPhysicalCash = {};
+      if (floatToUse?.openingMerchantSimPhysicalCash && typeof floatToUse.openingMerchantSimPhysicalCash === 'object') {
+        Object.keys(floatToUse.openingMerchantSimPhysicalCash).forEach(simId => {
+          merchantSimPhysicalCash[simId] = parseFloat(floatToUse.openingMerchantSimPhysicalCash[simId] || 0);
         });
-        return;
       }
-      
-      let physicalCash = parseFloat(todayFloat?.openingPhysicalCash || 0);
-      let mtnEcash = parseFloat(todayFloat?.openingMtnEcash || 0);
-      let vodafoneEcash = parseFloat(todayFloat?.openingVodafoneEcash || 0);
-      let airtelTigoEcash = parseFloat(todayFloat?.openingAirtelTigoEcash || 0);
-      let telecelEcash = parseFloat(todayFloat?.openingTelecelEcash || 0);
 
-      if (transactions.momo && Array.isArray(transactions.momo)) {
-      transactions.momo.forEach((t) => {
+      let physicalCash = parseFloat(floatToUse?.openingPhysicalCash || 0);
+      let mtnEcash = parseFloat(floatToUse?.openingMtnEcash || 0);
+      let vodafoneEcash = parseFloat(floatToUse?.openingVodafoneEcash || 0);
+      let airtelTigoEcash = parseFloat(floatToUse?.openingAirtelTigoEcash || 0);
+      let telecelEcash = parseFloat(floatToUse?.openingTelecelEcash || 0);
+      const bankBalances = {};
+      if (floatToUse?.openingBankBalances && typeof floatToUse.openingBankBalances === "object") {
+        Object.keys(floatToUse.openingBankBalances).forEach((name) => {
+          bankBalances[name] = parseFloat(floatToUse.openingBankBalances[name] || 0);
+        });
+      }
+      const businessId = selectedBusinessId || userData?.businessId;
+      let allSims = [];
+      let bankList = [];
+      try {
+        allSims = await merchantSimService.getByBranch(branchId, businessId);
+        bankList = await bankService.getByBusinessId(businessId);
+      } catch (_) {}
+      allSims.forEach((sim) => {
+        const id = sim.merchantSimId || sim.id;
+        if (merchantSimBalances[id] === undefined) merchantSimBalances[id] = 0;
+        if (merchantSimPhysicalCash[id] === undefined) merchantSimPhysicalCash[id] = 0;
+      });
+      (bankList || []).forEach((b) => {
+        const name = b.bankName || b;
+        if (bankBalances[name] === undefined) bankBalances[name] = 0;
+      });
+      // Process MoMo transactions if they exist
+      if (filteredTransactions?.momo && Array.isArray(filteredTransactions.momo)) {
+      filteredTransactions.momo.forEach((t) => {
         const amount = parseFloat(t.amount || 0);
           // Cash In: Customer gives physical cash → Agent credits customer E-Cash
           // Physical Cash increases, E-Cash decreases
-        if (t.transactionType === "cash_in") {
-            physicalCash += amount; // Agent receives physical cash
-            // If transaction has merchant SIM, update that specific SIM balance
+        const simHasPhysicalFloat = floatToUse?.openingMerchantSimPhysicalCash && typeof floatToUse.openingMerchantSimPhysicalCash === "object"
+          ? (simId) => floatToUse.openingMerchantSimPhysicalCash[simId] != null
+          : () => false;
+        if (t.transactionType === "cash_in" || t.transactionType === "deposit") {
+            if (t.merchantSimId && simHasPhysicalFloat(t.merchantSimId)) {
+              if (merchantSimPhysicalCash[t.merchantSimId] === undefined) merchantSimPhysicalCash[t.merchantSimId] = parseFloat(floatToUse?.openingMerchantSimPhysicalCash?.[t.merchantSimId] || 0);
+              merchantSimPhysicalCash[t.merchantSimId] += amount;
+            } else {
+              physicalCash += amount;
+            }
             if (t.merchantSimId && merchantSimBalances.hasOwnProperty(t.merchantSimId)) {
               merchantSimBalances[t.merchantSimId] -= amount;
             } else {
-              // Fallback to provider-level tracking
-          if (t.provider === "MTN") mtnEcash -= amount;
-          else if (t.provider === "Vodafone") vodafoneEcash -= amount;
-          else if (t.provider === "AirtelTigo") airtelTigoEcash -= amount;
-          else if (t.provider === "Telecel") telecelEcash -= amount;
+              if (t.provider === "MTN") mtnEcash -= amount;
+              else if (t.provider === "Vodafone") vodafoneEcash -= amount;
+              else if (t.provider === "AirtelTigo") airtelTigoEcash -= amount;
+              else if (t.provider === "Telecel") telecelEcash -= amount;
             }
-          } 
-          // Cash Out: Customer receives physical cash → Customer credits agent E-Cash
-          // Physical Cash decreases, E-Cash increases
-          else if (t.transactionType === "cash_out") {
-            physicalCash -= amount; // Agent gives physical cash
-            // If transaction has merchant SIM, update that specific SIM balance
+          } else if (t.transactionType === "cash_out") {
+            const useSimFloat = t.physicalCashSource === "sim_float" || (t.physicalCashSource !== "branch_opening" && t.merchantSimId && simHasPhysicalFloat(t.merchantSimId));
+            if (useSimFloat && t.merchantSimId && simHasPhysicalFloat(t.merchantSimId)) {
+              if (merchantSimPhysicalCash[t.merchantSimId] === undefined) merchantSimPhysicalCash[t.merchantSimId] = parseFloat(floatToUse?.openingMerchantSimPhysicalCash?.[t.merchantSimId] || 0);
+              merchantSimPhysicalCash[t.merchantSimId] -= amount;
+            } else {
+              physicalCash -= amount;
+            }
             if (t.merchantSimId && merchantSimBalances.hasOwnProperty(t.merchantSimId)) {
               merchantSimBalances[t.merchantSimId] += amount;
             } else {
-              // Fallback to provider-level tracking
               if (t.provider === "MTN") mtnEcash += amount;
               else if (t.provider === "Vodafone") vodafoneEcash += amount;
               else if (t.provider === "AirtelTigo") airtelTigoEcash += amount;
@@ -245,9 +338,9 @@ export default function FloatManagement() {
         });
       }
       
-      // Process bank transactions
-      if (transactions.bank && Array.isArray(transactions.bank)) {
-        transactions.bank.forEach((t) => {
+      // Process bank transactions if they exist
+      if (filteredTransactions?.bank && Array.isArray(filteredTransactions.bank)) {
+        filteredTransactions.bank.forEach((t) => {
           const amount = parseFloat(t.amount || 0);
           if (isNaN(amount) || amount <= 0) {
             console.warn("Skipping invalid bank transaction:", t);
@@ -267,6 +360,117 @@ export default function FloatManagement() {
         });
       }
 
+      // Process SIM Sales (both regular SIM sales and airtime sales)
+      try {
+        let simSalesQuery = query(
+          collection(db, "sim_sales"),
+          where("branchId", "==", branchId),
+          where("date", "==", dateString)
+        );
+        
+        // If user is not admin, filter by recordedBy
+        if (!isAdmin && userData?.userId) {
+          simSalesQuery = query(
+            collection(db, "sim_sales"),
+            where("branchId", "==", branchId),
+            where("date", "==", dateString),
+            where("recordedBy", "==", userData.userId)
+          );
+        }
+        
+        const simSalesSnapshot = await getDocs(simSalesQuery).catch(() => ({ docs: [] }));
+        const simSales = simSalesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        
+        simSales.forEach((sale) => {
+          if (!sale.saleType || sale.saleType === "sim_sale") {
+            const totalAmount = parseFloat(sale.totalAmount || 0);
+            if (!isNaN(totalAmount) && totalAmount > 0 && sale.paymentMethod === "cash") {
+              physicalCash += totalAmount;
+            }
+          } else if (sale.saleType === "bundle") {
+            const amount = parseFloat(sale.amount || sale.totalAmount || 0);
+            if (!isNaN(amount) && amount > 0) {
+              physicalCash += amount;
+              if (sale.merchantSimId && merchantSimBalances.hasOwnProperty(sale.merchantSimId)) {
+                merchantSimBalances[sale.merchantSimId] -= amount;
+              }
+            }
+          } else if (sale.saleType === "airtime") {
+            const price = parseFloat(sale.price || 0);
+            if (!isNaN(price) && price > 0) {
+              // Decrease E-Cash for the merchant SIM
+              if (sale.merchantSimId && merchantSimBalances.hasOwnProperty(sale.merchantSimId)) {
+                merchantSimBalances[sale.merchantSimId] -= price;
+              } else {
+                // Fallback to provider-level tracking
+                if (sale.provider === "MTN") mtnEcash -= price;
+                else if (sale.provider === "Vodafone") vodafoneEcash -= price;
+                else if (sale.provider === "AirtelTigo") airtelTigoEcash -= price;
+              }
+              
+              // If paid in cash, increase physical cash
+              if (sale.paymentMethod === "cash") {
+                physicalCash += price;
+              }
+            }
+          }
+        });
+      } catch (error) {
+        console.error("Error loading SIM sales:", error);
+      }
+
+      // Process top-ups for the float date
+      try {
+        const topUps = await topUpService.getByBranchAndDate(branchId, floatDate);
+        topUps.forEach((topUp) => {
+          const amount = parseFloat(topUp.amount || 0);
+          if (isNaN(amount) || amount <= 0) return;
+
+          if (topUp.topUpType === "physical_cash") {
+            physicalCash += amount;
+          } else if (topUp.topUpType === "merchant_sim_ecash" && topUp.merchantSimId) {
+            if (merchantSimBalances.hasOwnProperty(topUp.merchantSimId)) {
+              merchantSimBalances[topUp.merchantSimId] += amount;
+            } else {
+              merchantSimBalances[topUp.merchantSimId] = amount;
+            }
+          } else if (topUp.topUpType === "sim_to_sim" && topUp.fromMerchantSimId && topUp.toMerchantSimId) {
+            const amt = parseFloat(topUp.amount || 0);
+            if (merchantSimBalances.hasOwnProperty(topUp.fromMerchantSimId)) merchantSimBalances[topUp.fromMerchantSimId] -= amt;
+            if (merchantSimBalances.hasOwnProperty(topUp.toMerchantSimId)) merchantSimBalances[topUp.toMerchantSimId] += amt;
+          } else if (topUp.topUpType === "bank_to_sim" && topUp.merchantSimId) {
+            if (merchantSimBalances.hasOwnProperty(topUp.merchantSimId)) merchantSimBalances[topUp.merchantSimId] += amount;
+            else merchantSimBalances[topUp.merchantSimId] = amount;
+            if (topUp.bankName) bankBalances[topUp.bankName] = (bankBalances[topUp.bankName] ?? 0) - amount;
+          } else if (topUp.topUpType === "sim_to_bank" && topUp.fromMerchantSimId) {
+            const amt = parseFloat(topUp.amount || 0);
+            if (merchantSimBalances.hasOwnProperty(topUp.fromMerchantSimId)) {
+              merchantSimBalances[topUp.fromMerchantSimId] -= amt;
+            }
+            if (topUp.bankName) {
+              bankBalances[topUp.bankName] = (bankBalances[topUp.bankName] ?? 0) + amt;
+            }
+          } else if (topUp.topUpType === "sim_to_sim_physical" && topUp.fromMerchantSimId && topUp.toMerchantSimId) {
+            const amt = parseFloat(topUp.amount || 0);
+            if (merchantSimPhysicalCash[topUp.fromMerchantSimId] !== undefined) merchantSimPhysicalCash[topUp.fromMerchantSimId] -= amt;
+            if (merchantSimPhysicalCash[topUp.toMerchantSimId] !== undefined) merchantSimPhysicalCash[topUp.toMerchantSimId] += amt;
+            else merchantSimPhysicalCash[topUp.toMerchantSimId] = amt;
+          } else if (topUp.topUpType === "bank_to_sim_physical" && topUp.merchantSimId && topUp.bankName) {
+            const amt = parseFloat(topUp.amount || 0);
+            if (bankBalances[topUp.bankName] !== undefined) bankBalances[topUp.bankName] -= amt;
+            if (merchantSimPhysicalCash[topUp.merchantSimId] !== undefined) merchantSimPhysicalCash[topUp.merchantSimId] += amt;
+            else merchantSimPhysicalCash[topUp.merchantSimId] = amt;
+          } else if (topUp.topUpType === "sim_to_bank_physical" && topUp.fromMerchantSimId && topUp.bankName) {
+            const amt = parseFloat(topUp.amount || 0);
+            if (merchantSimPhysicalCash[topUp.fromMerchantSimId] !== undefined) merchantSimPhysicalCash[topUp.fromMerchantSimId] -= amt;
+            if (bankBalances[topUp.bankName] !== undefined) bankBalances[topUp.bankName] += amt;
+            else bankBalances[topUp.bankName] = amt;
+          }
+        });
+      } catch (error) {
+        console.error("Error loading top-ups:", error);
+      }
+
       setExpectedBalances({
         physicalCash,
         mtnEcash,
@@ -274,15 +478,20 @@ export default function FloatManagement() {
         airtelTigoEcash,
         telecelEcash,
         merchantSimEcash: merchantSimBalances,
+        merchantSimPhysicalCash,
+        bankBalances,
       });
     } catch (error) {
       console.error("Error calculating expected balances:", error);
+      const floatToUse = selectedPendingFloat || todayFloat;
       setExpectedBalances({
-        physicalCash: parseFloat(todayFloat?.openingPhysicalCash || 0),
-        mtnEcash: parseFloat(todayFloat?.openingMtnEcash || 0),
-        vodafoneEcash: parseFloat(todayFloat?.openingVodafoneEcash || 0),
-        airtelTigoEcash: parseFloat(todayFloat?.openingAirtelTigoEcash || 0),
-        telecelEcash: parseFloat(todayFloat?.openingTelecelEcash || 0),
+        physicalCash: parseFloat(floatToUse?.openingPhysicalCash || 0),
+        mtnEcash: parseFloat(floatToUse?.openingMtnEcash || 0),
+        vodafoneEcash: parseFloat(floatToUse?.openingVodafoneEcash || 0),
+        airtelTigoEcash: parseFloat(floatToUse?.openingAirtelTigoEcash || 0),
+        telecelEcash: parseFloat(floatToUse?.openingTelecelEcash || 0),
+        merchantSimPhysicalCash: floatToUse?.openingMerchantSimPhysicalCash && typeof floatToUse.openingMerchantSimPhysicalCash === 'object' ? { ...floatToUse.openingMerchantSimPhysicalCash } : {},
+        bankBalances: floatToUse?.openingBankBalances && typeof floatToUse.openingBankBalances === 'object' ? { ...floatToUse.openingBankBalances } : {},
       });
     }
   };
@@ -292,7 +501,13 @@ export default function FloatManagement() {
       if (!branchId) return;
       if (isCreatingFloat.current) return;
       const today = new Date();
-      const float = await dailyFloatService.getByBranchAndDate(branchId, today);
+      let float = null;
+      if (userData?.role === "branch_manager" || userData?.role === "admin") {
+        const floats = await dailyFloatService.getFloatsByBranchAndDate(branchId, today);
+        float = floats.length > 0 ? floats[0] : null;
+      } else {
+        float = await dailyFloatService.getByBranchDateAndUser(branchId, today, userData?.userId);
+      }
       if (float) {
         hasFloatInState.current = true;
         setTodayFloat(float);
@@ -301,7 +516,7 @@ export default function FloatManagement() {
         setFormData((prev) => {
           const newFormData = {
             ...prev,
-            ...float,
+          ...float,
             date: float.date?.toDate?.()?.toISOString().split("T")[0] || 
                   (typeof float.date === 'string' ? float.date : prev.date),
           };
@@ -310,22 +525,37 @@ export default function FloatManagement() {
           if (!hasClosingValues) {
             newFormData.closingPhysicalCash = "";
             newFormData.closingMerchantSimEcash = {};
+            newFormData.closingMerchantSimPhysicalCash = {};
+            newFormData.closingBankBalances = {};
           } else {
             newFormData.closingPhysicalCash = float.closingPhysicalCash || "";
             newFormData.closingMerchantSimEcash = float.closingMerchantSimEcash || {};
+            newFormData.closingMerchantSimPhysicalCash = float.closingMerchantSimPhysicalCash || {};
+            newFormData.closingBankBalances = float.closingBankBalances || {};
           }
-          
+          newFormData.openingMerchantSimPhysicalCash = float.openingMerchantSimPhysicalCash || {};
           return newFormData;
         });
-        // Set mode based on whether float is closed
-        if (!float.closingPhysicalCash || float.closingPhysicalCash === "") {
+        const isClosed = float.closingPhysicalCash && float.closingPhysicalCash !== "";
+        const unlockedByItAdmin = float.unlockedByItAdmin === true;
+        setIsFloatClosedToday(isClosed && !unlockedByItAdmin);
+        setClosedFloatIdForUnlock(isClosed ? float.floatId : null);
+        if (!isClosed) {
           setMode("closing");
       } else {
           setMode("view");
+          // Show good evening modal if float was just closed today
+          const floatDate = float.date?.toDate ? float.date.toDate().toISOString().split("T")[0] : 
+                           (typeof float.date === 'string' ? float.date : new Date(float.date).toISOString().split("T")[0]);
+          const today = new Date().toISOString().split("T")[0];
+          if (floatDate === today) {
+            setShowGoodEveningModal(true);
+          }
         }
       } else {
-        // Query succeeded but no float found - reset the flag
         hasFloatInState.current = false;
+        setIsFloatClosedToday(false);
+        setClosedFloatIdForUnlock(null);
         // Don't reset mode if we're skipping reset OR if we already have a float in state
         // Check both the ref and the state to handle remounts
         if (!skipModeReset && !isCreatingFloat.current) {
@@ -363,13 +593,40 @@ export default function FloatManagement() {
     }
   };
 
+  const loadPendingFloats = async () => {
+    try {
+      if (!branchId) return;
+      const allFloats = await dailyFloatService.getByBranch(branchId, 100);
+      const pending = allFloats.filter(f => {
+        // A float is considered "unclosed" ONLY if there is no valid closing physical cash value recorded.
+        // Treat both string and numeric values as valid as long as they are not empty/NaN.
+        const rawClosing = f.closingPhysicalCash;
+        const closingNumber =
+          rawClosing !== undefined && rawClosing !== null && rawClosing !== ""
+            ? parseFloat(rawClosing)
+            : NaN;
+        const hasValidClosing =
+          rawClosing !== undefined &&
+          rawClosing !== null &&
+          rawClosing !== "" &&
+          !Number.isNaN(closingNumber);
+        const isUnclosed = !hasValidClosing;
+        return isUnclosed;
+      });
+      setPendingFloats(pending);
+    } catch (error) {
+      console.error("Error loading pending floats:", error);
+    }
+  };
+
   const calculateVariance = () => {
-    if (!todayFloat) return { physicalCash: 0, mtn: 0, vodafone: 0, airtelTigo: 0, telecel: 0 };
+    const floatToUse = selectedPendingFloat || todayFloat;
+    if (!floatToUse) return { physicalCash: 0, mtn: 0, vodafone: 0, airtelTigo: 0, telecel: 0 };
     
     // Only calculate variance if closing values are entered
     const closingPhysical = parseFloat(formData.closingPhysicalCash || 0);
     if (!formData.closingPhysicalCash || formData.closingPhysicalCash === "") {
-      return { physicalCash: 0, mtn: 0, vodafone: 0, airtelTigo: 0, telecel: 0 };
+      return { physicalCash: 0, mtn: 0, vodafone: 0, airtelTigo: 0, telecel: 0, merchantSim: {} };
     }
     
     const expectedPhysical = expectedBalances.physicalCash;
@@ -408,26 +665,105 @@ export default function FloatManagement() {
       return;
     }
     
-    // Check if there's an unclosed float (any float with status "pending" or "flagged")
-    const unclosedFloat = floatHistory.find(f => {
-      const status = f.status || "pending";
-      return status === "pending" || status === "flagged";
+    // First check pendingFloats state (most up-to-date)
+    if (pendingFloats.length > 0) {
+      const firstPending = pendingFloats[0];
+      const floatDate = firstPending.date?.toDate ? firstPending.date.toDate().toLocaleDateString() : new Date(firstPending.date).toLocaleDateString();
+      alert(`Cannot create a new opening float. You have ${pendingFloats.length} unclosed float(s). Please close them first. The oldest pending float is from ${floatDate}.`);
+      setShowPendingFloatsModal(true);
+      return;
+    }
+    
+    // Check if there's an unclosed float in history.
+    // A float is considered unclosed ONLY if it has no valid closingPhysicalCash value.
+    const unclosedFloatInHistory = floatHistory.find(f => {
+      const rawClosing = f.closingPhysicalCash;
+      const closingNumber =
+        rawClosing !== undefined && rawClosing !== null && rawClosing !== ""
+          ? parseFloat(rawClosing)
+          : NaN;
+      const hasValidClosing =
+        rawClosing !== undefined &&
+        rawClosing !== null &&
+        rawClosing !== "" &&
+        !Number.isNaN(closingNumber);
+      return !hasValidClosing;
     });
     
-    if (unclosedFloat) {
-      alert("Cannot create a new opening float. Please close the previous float first. There is an unclosed float that needs to be closed.");
+    if (unclosedFloatInHistory) {
+      const floatDate = unclosedFloatInHistory.date?.toDate ? unclosedFloatInHistory.date.toDate().toLocaleDateString() : new Date(unclosedFloatInHistory.date).toLocaleDateString();
+      alert(`Cannot create a new opening float. Please close the previous float first. There is an unclosed float from ${floatDate} that needs to be closed.`);
+      // Reload pending floats to show modal
+      await loadPendingFloats();
       return;
     }
     
     // Also check todayFloat in state
-    if (todayFloat && (todayFloat.status === "pending" || todayFloat.status === "flagged")) {
-      alert("Cannot create a new opening float. Please close the current float first.");
+    const today = new Date().toISOString().split("T")[0];
+    const todayFloatDate = todayFloat?.date?.toDate ? todayFloat.date.toDate().toISOString().split("T")[0] : 
+                          (typeof todayFloat?.date === 'string' ? todayFloat.date : null);
+    const isTodayFloat = todayFloatDate === today;
+    
+    if (todayFloat && !isTodayFloat) {
+      const rawClosing = todayFloat.closingPhysicalCash;
+      const closingNumber =
+        rawClosing !== undefined && rawClosing !== null && rawClosing !== ""
+          ? parseFloat(rawClosing)
+          : NaN;
+      const hasValidClosing =
+        rawClosing !== undefined &&
+        rawClosing !== null &&
+        rawClosing !== "" &&
+        !Number.isNaN(closingNumber);
+      const isUnclosed = !hasValidClosing;
+
+      if (isUnclosed) {
+      alert("Cannot create a new opening float. Please close the previous float first.");
+      // Reload pending floats to show modal
+      await loadPendingFloats();
       return;
+      }
+    }
+    
+    // Check database for any unclosed float (from any date)
+    try {
+      const allFloats = await dailyFloatService.getByBranch(branchId, 100); // Get more floats to check
+      const unclosedFloat = allFloats.find(f => {
+        // A float is considered "unclosed" ONLY if there is no valid closing physical cash value recorded.
+        const rawClosing = f.closingPhysicalCash;
+        const closingNumber =
+          rawClosing !== undefined && rawClosing !== null && rawClosing !== ""
+            ? parseFloat(rawClosing)
+            : NaN;
+        const hasValidClosing =
+          rawClosing !== undefined &&
+          rawClosing !== null &&
+          rawClosing !== "" &&
+          !Number.isNaN(closingNumber);
+        const isUnclosed = !hasValidClosing;
+        return isUnclosed;
+      });
+      
+      if (unclosedFloat) {
+        const floatDate = unclosedFloat.date?.toDate ? unclosedFloat.date.toDate().toLocaleDateString() : new Date(unclosedFloat.date).toLocaleDateString();
+        alert(`Cannot create a new opening float. Please close the previous float first. There is an unclosed float from ${floatDate} that needs to be closed.`);
+        // Reload pending floats to show modal
+        await loadPendingFloats();
+        return;
+      }
+    } catch (error) {
+      console.error("Error checking for unclosed floats:", error);
+      // Continue anyway - don't block if query fails, but log the error
     }
     
     setLoading(true);
     isCreatingFloat.current = true;
     try {
+      // Check if this is a new day (no float exists for today)
+      const today = new Date().toISOString().split("T")[0];
+      const existingFloat = await dailyFloatService.getByBranchDateAndUser(branchId, new Date(today), userData?.userId);
+      const isNewDay = !existingFloat;
+      
       const floatId = await dailyFloatService.create({
         businessId: businessId,
         branchId: branchId,
@@ -437,6 +773,7 @@ export default function FloatManagement() {
       });
       
       setMode("closing");
+      setIsFloatClosedToday(false);
       
       const newFloat = {
         floatId,
@@ -456,7 +793,25 @@ export default function FloatManagement() {
         date: formData.date,
       }));
       
-      alert("Opening float recorded successfully! You can now start day operations.");
+      // Log activity (best-effort)
+      try {
+        await activityLogService.log({
+          userId: userData?.userId || null,
+          userName: userData?.name || userData?.email || "Unknown User",
+          businessId,
+          branchId,
+          actionType: "float_opening_created",
+          details: `Opening float recorded for ${formData.date} with opening physical cash GHS ${formData.openingPhysicalCash || "0.00"}.`,
+          status: "success",
+        });
+      } catch (logError) {
+        console.error("Failed to log opening float activity:", logError);
+      }
+
+      // Show good morning modal if it's a new day
+      if (isNewDay) {
+        setShowGoodMorningModal(true);
+      }
       
       // Keep isCreatingFloat true until load completes
       setTimeout(async () => {
@@ -527,6 +882,21 @@ export default function FloatManagement() {
       // Reload the float to show updated status
       await loadTodayFloat();
       await loadFloatHistory();
+      
+      // Log variance approval (best-effort)
+      try {
+        await activityLogService.log({
+          userId: userData?.userId || null,
+          userName: userData?.name || userData?.email || "Unknown User",
+          businessId,
+          branchId,
+          actionType: "float_variance_approved",
+          details: `Variance for float ${todayFloat.floatId} approved. Manager comments: ${formData.managerComments || todayFloat.managerComments || "None"}.`,
+          status: "success",
+        });
+      } catch (logError) {
+        console.error("Failed to log float variance approval:", logError);
+      }
     } catch (error) {
       alert("Error approving variance: " + error.message);
     } finally {
@@ -595,7 +965,8 @@ export default function FloatManagement() {
 
   const handleClosingSubmit = async (e) => {
     e.preventDefault();
-    if (!todayFloat) {
+    const floatToClose = selectedPendingFloat || todayFloat;
+    if (!floatToClose) {
       alert("Please record opening float first!");
       return;
     }
@@ -611,7 +982,7 @@ export default function FloatManagement() {
       // Allow approval of any variance amount - all variances can be flagged for review
       const status = Math.abs(variancePercentage) > 0 ? "flagged" : "pending";
 
-      await dailyFloatService.update(todayFloat.floatId, {
+      await dailyFloatService.update(floatToClose.floatId, {
         ...formData,
         variance: variances.physicalCash,
         variancePercentage,
@@ -621,14 +992,36 @@ export default function FloatManagement() {
         recordedBy: userData.userId,
         recordedByName: userData.name || userData.email,
         status,
+        unlockedByItAdmin: false,
       });
       
-      alert("Closing float recorded successfully! You can now start a new day.");
-      
-      // Clear today's float and reset to opening mode for new day
+      // Log closing float (best-effort)
+      try {
+        await activityLogService.log({
+          userId: userData?.userId || null,
+          userName: userData?.name || userData?.email || "Unknown User",
+          businessId,
+          branchId,
+          actionType: "float_closing_recorded",
+          details: `Closing float recorded for ${formData.date} with closing physical cash GHS ${formData.closingPhysicalCash || "0.00"}. Variance: GHS ${
+            typeof variances.physicalCash === "number"
+              ? variances.physicalCash.toFixed(2)
+              : variances.physicalCash
+          }.`,
+          status: "success",
+        });
+      } catch (logError) {
+        console.error("Failed to log closing float activity:", logError);
+      }
+
+      setShowGoodEveningModal(true);
+      setIsFloatClosedToday(true);
+      setClosedFloatIdForUnlock(floatToClose.floatId);
       hasFloatInState.current = false;
       setTodayFloat(null);
-      setMode("opening");
+      setSelectedPendingFloat(null);
+      setShowCloseFloatModal(false);
+      setMode("view");
       
       // Reset form data for new day
       setFormData({
@@ -639,6 +1032,9 @@ export default function FloatManagement() {
         openingVodafoneEcash: "",
         openingAirtelTigoEcash: "",
         openingTelecelEcash: "",
+        openingMerchantSimEcash: {},
+        openingMerchantSimPhysicalCash: {},
+        openingBankBalances: {},
         floatReceivedFromHQ: "",
         floatReceivedFromBank: "",
         receivedBy: "",
@@ -648,6 +1044,9 @@ export default function FloatManagement() {
         closingVodafoneEcash: "",
         closingAirtelTigoEcash: "",
         closingTelecelEcash: "",
+        closingMerchantSimEcash: {},
+        closingMerchantSimPhysicalCash: {},
+        closingBankBalances: {},
         variance: "",
         varianceReason: "",
         cashBanked: [],
@@ -658,21 +1057,45 @@ export default function FloatManagement() {
         managerComments: "",
         status: "pending",
       });
-      
-      // Reload float history to show the closed float
-      await loadFloatHistory();
       setExpectedBalances({
         physicalCash: 0,
         mtnEcash: 0,
         vodafoneEcash: 0,
         airtelTigoEcash: 0,
         telecelEcash: 0,
+        merchantSimEcash: {},
+        merchantSimPhysicalCash: {},
       });
     } catch (error) {
       alert("Error recording closing float: " + error.message);
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleSelectPendingFloat = async (float) => {
+    setSelectedPendingFloat(float);
+    setShowPendingFloatsModal(false);
+    
+    // Set todayFloat temporarily to use existing closing form logic
+    setTodayFloat(float);
+    
+    // Load form data from the selected float
+    setFormData(prev => ({
+      ...prev,
+      ...float,
+      date: float.date?.toDate?.()?.toISOString().split("T")[0] ||
+            (typeof float.date === 'string' ? float.date : prev.date),
+      closingPhysicalCash: float.closingPhysicalCash || "",
+      closingMerchantSimEcash: float.closingMerchantSimEcash || {},
+      closingMerchantSimPhysicalCash: float.closingMerchantSimPhysicalCash || {},
+      closingBankBalances: float.closingBankBalances || {},
+    }));
+    
+    // Calculate expected balances for this float
+    await calculateExpectedBalances();
+    
+    setShowCloseFloatModal(true);
   };
 
   const variances = calculateVariance();
@@ -687,10 +1110,55 @@ export default function FloatManagement() {
     : (totalVariance > 0 ? 100 : 0); // If expected is 0 but there's variance, show 100%
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-3xl font-bold">Daily Float Management</h1>
-        <p className="text-muted-foreground">Record opening and closing float balances</p>
+    <div className="space-y-6 relative">
+      {isFloatClosedToday && (
+        <div className="absolute inset-0 bg-white/90 backdrop-blur-sm z-40 flex items-center justify-center pointer-events-auto">
+          <Card className="w-full max-w-md mx-4 pointer-events-auto">
+            <CardContent className="pt-6">
+              <div className="text-center space-y-4">
+                <div className="text-6xl">🔒</div>
+                <h2 className="text-2xl font-bold">Day Closed</h2>
+                <p className="text-muted-foreground">
+                  Today's float has been closed. All activities are locked until a new day begins.
+                </p>
+                {userData?.role === "it_admin" && closedFloatIdForUnlock && (
+                  <Button
+                    variant="outline"
+                    onClick={async () => {
+                      try {
+                        await dailyFloatService.update(closedFloatIdForUnlock, { unlockedByItAdmin: true });
+                        setClosedFloatIdForUnlock(null);
+                        await loadTodayFloat();
+                        calculateExpectedBalances();
+                      } catch (e) {
+                        alert("Failed to unlock: " + e.message);
+                      }
+                    }}
+                  >
+                    Unlock float (IT Admin only)
+                  </Button>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+      
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="page-title">Daily Float Management</h1>
+          <p className="page-description">Record opening and closing float balances</p>
+        </div>
+        {!isFloatClosedToday && todayFloat && (
+          <Button
+            variant="outline"
+            onClick={() => setShowTopUpModal(true)}
+            className="flex items-center gap-2"
+          >
+            <ArrowUpCircle className="h-4 w-4" />
+            Top-Up Float/Cash
+          </Button>
+        )}
       </div>
 
       <div className="flex gap-4">
@@ -711,7 +1179,23 @@ export default function FloatManagement() {
       </div>
 
       {mode === "opening" && (
-        <Card>
+        <Card className={pendingFloats.length > 0 ? "opacity-50 pointer-events-none relative" : ""}>
+          {pendingFloats.length > 0 && (
+            <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/80 rounded-lg">
+              <div className="text-center p-6 bg-yellow-50 border-2 border-yellow-400 rounded-lg shadow-lg max-w-md">
+                <AlertCircle className="h-12 w-12 text-yellow-600 mx-auto mb-4" />
+                <h3 className="text-lg font-semibold text-yellow-900 mb-2">
+                  Cannot Create New Opening Float
+                </h3>
+                <p className="text-sm text-yellow-800 mb-4">
+                  You have {pendingFloats.length} unclosed float(s) that must be closed before creating a new opening float.
+                </p>
+                <p className="text-xs text-yellow-700">
+                  Please select a pending float from the modal above to close it first.
+                </p>
+              </div>
+            </div>
+          )}
           <CardHeader>
             <CardTitle>Morning Float Opening</CardTitle>
           </CardHeader>
@@ -757,7 +1241,7 @@ export default function FloatManagement() {
                     />
                   </div>
                   {/* Merchant SIM E-Cash sections per provider */}
-                  {["MTN", "Vodafone", "AirtelTigo", "Telecel"].map((provider) => {
+                  {["MTN", "AirtelTigo", "Telecel"].map((provider) => {
                     const providerSims = merchantSims.filter(sim => sim.provider === provider);
                     return (
                       <div key={provider} className="col-span-2 border rounded-md p-4 space-y-3">
@@ -783,33 +1267,49 @@ export default function FloatManagement() {
                               const fieldKey = `opening_${sim.merchantSimId}`;
                               const value = formData.openingMerchantSimEcash?.[sim.merchantSimId] || "";
                               return (
-                                <div key={sim.merchantSimId} className="space-y-2">
-                                  <Label htmlFor={fieldKey}>{sim.simName} E-Cash (GHS) *</Label>
-                    <Input
-                                    id={fieldKey}
-                                    type="text"
-                                    inputMode="decimal"
-                                    value={value}
-                                    onChange={(e) => {
-                                      const updated = {
-                                        ...formData.openingMerchantSimEcash,
-                                        [sim.merchantSimId]: e.target.value,
-                                      };
-                                      setFormData({ ...formData, openingMerchantSimEcash: updated });
-                                    }}
-                                    onBlur={(e) => {
-                                      const num = parseFloat(e.target.value);
-                                      if (!isNaN(num)) {
-                                        const updated = {
-                                          ...formData.openingMerchantSimEcash,
-                                          [sim.merchantSimId]: num.toFixed(2),
-                                        };
+                                <div key={sim.merchantSimId} className="space-y-2 md:col-span-2 grid gap-2 md:grid-cols-2">
+                                  <div>
+                                    <Label htmlFor={fieldKey}>{sim.simName} E-Cash (GHS) *</Label>
+                                    <Input
+                                      id={fieldKey}
+                                      type="text"
+                                      inputMode="decimal"
+                                      value={value}
+                                      onChange={(e) => {
+                                        const updated = { ...formData.openingMerchantSimEcash, [sim.merchantSimId]: e.target.value };
                                         setFormData({ ...formData, openingMerchantSimEcash: updated });
-                                      }
-                                    }}
-                      required
-                    />
-                  </div>
+                                      }}
+                                      onBlur={(e) => {
+                                        const num = parseFloat(e.target.value);
+                                        if (!isNaN(num)) {
+                                          const updated = { ...formData.openingMerchantSimEcash, [sim.merchantSimId]: num.toFixed(2) };
+                                          setFormData({ ...formData, openingMerchantSimEcash: updated });
+                                        }
+                                      }}
+                                      required
+                                    />
+                                  </div>
+                                  <div>
+                                    <Label htmlFor={`opening_physical_${sim.merchantSimId}`}>{sim.simName} Physical Cash (GHS)</Label>
+                                    <Input
+                                      id={`opening_physical_${sim.merchantSimId}`}
+                                      type="text"
+                                      inputMode="decimal"
+                                      value={formData.openingMerchantSimPhysicalCash?.[sim.merchantSimId] ?? ""}
+                                      onChange={(e) => {
+                                        const updated = { ...formData.openingMerchantSimPhysicalCash, [sim.merchantSimId]: e.target.value };
+                                        setFormData({ ...formData, openingMerchantSimPhysicalCash: updated });
+                                      }}
+                                      onBlur={(e) => {
+                                        const num = parseFloat(e.target.value);
+                                        if (!isNaN(num)) {
+                                          const updated = { ...formData.openingMerchantSimPhysicalCash, [sim.merchantSimId]: num.toFixed(2) };
+                                          setFormData({ ...formData, openingMerchantSimPhysicalCash: updated });
+                                        }
+                                      }}
+                                    />
+                                  </div>
+                                </div>
                               );
                             })}
                           </div>
@@ -849,6 +1349,41 @@ export default function FloatManagement() {
                   })}
                 </div>
               </div>
+
+              {banks.length > 0 && (
+                <div className="border-t pt-4">
+                  <h3 className="text-lg font-semibold mb-4">Opening Bank Balances (GHS)</h3>
+                  <div className="grid gap-4 md:grid-cols-2">
+                    {banks.map((b) => {
+                      const bankName = b.bankName || b.id;
+                      const value = formData.openingBankBalances?.[bankName] ?? "";
+                      return (
+                        <div key={bankName} className="space-y-2">
+                          <Label htmlFor={`opening_bank_${bankName}`}>{bankName}</Label>
+                          <Input
+                            id={`opening_bank_${bankName}`}
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            value={value}
+                            onChange={(e) => {
+                              const updated = { ...formData.openingBankBalances, [bankName]: e.target.value };
+                              setFormData({ ...formData, openingBankBalances: updated });
+                            }}
+                            onBlur={(e) => {
+                              const num = parseFloat(e.target.value);
+                              if (!isNaN(num) && num >= 0) {
+                                const updated = { ...formData.openingBankBalances, [bankName]: num.toFixed(2) };
+                                setFormData({ ...formData, openingBankBalances: updated });
+                              }
+                            }}
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
 
               <div className="border-t pt-4">
                 <h3 className="text-lg font-semibold mb-4">Float Received (if any)</h3>
@@ -945,10 +1480,18 @@ export default function FloatManagement() {
                               });
                             }
                             
+                            const closingBankBalances = {};
+                            if (expectedBalances.bankBalances && typeof expectedBalances.bankBalances === "object") {
+                              Object.keys(expectedBalances.bankBalances).forEach((name) => {
+                                const v = expectedBalances.bankBalances[name];
+                                if (v !== undefined && v !== null && !isNaN(v)) closingBankBalances[name] = parseFloat(v).toFixed(2);
+                              });
+                            }
                             setFormData(prev => ({
                               ...prev,
                               closingPhysicalCash: expectedBalances.physicalCash.toFixed(2),
                               closingMerchantSimEcash: { ...prev.closingMerchantSimEcash, ...merchantSimEcash },
+                              closingBankBalances: { ...prev.closingBankBalances, ...closingBankBalances },
                             }));
                           }, 100);
                         }}
@@ -973,7 +1516,7 @@ export default function FloatManagement() {
                     )}
                   </div>
                   {/* Merchant SIM E-Cash sections per provider for closing */}
-                  {["MTN", "Vodafone", "AirtelTigo", "Telecel"].map((provider) => {
+                  {["MTN", "AirtelTigo", "Telecel"].map((provider) => {
                     const providerSims = merchantSims.filter(sim => sim.provider === provider);
                     return (
                       <div key={provider} className="col-span-2 border rounded-md p-4 space-y-3">
@@ -998,41 +1541,55 @@ export default function FloatManagement() {
                             {providerSims.map((sim) => {
                               const fieldKey = `closing_${sim.merchantSimId}`;
                               const value = formData.closingMerchantSimEcash?.[sim.merchantSimId] || "";
-                              const expectedKey = `expected_${sim.merchantSimId}`;
                               const expectedValue = expectedBalances.merchantSimEcash?.[sim.merchantSimId] || 0;
+                              const physicalValue = formData.closingMerchantSimPhysicalCash?.[sim.merchantSimId] ?? "";
+                              const expectedPhysical = expectedBalances.merchantSimPhysicalCash?.[sim.merchantSimId] ?? 0;
                               return (
-                                <div key={sim.merchantSimId} className="space-y-2">
-                                  <Label htmlFor={fieldKey}>{sim.simName} E-Cash Balance (GHS) *</Label>
-                    <Input
-                                    id={fieldKey}
-                                    type="text"
-                                    inputMode="decimal"
-                                    value={value}
-                                    onChange={(e) => {
-                                      const updated = {
-                                        ...formData.closingMerchantSimEcash,
-                                        [sim.merchantSimId]: e.target.value,
-                                      };
-                                      setFormData({ ...formData, closingMerchantSimEcash: updated });
-                                    }}
-                                    onBlur={(e) => {
-                                      const num = parseFloat(e.target.value);
-                                      if (!isNaN(num)) {
-                                        const updated = {
-                                          ...formData.closingMerchantSimEcash,
-                                          [sim.merchantSimId]: num.toFixed(2),
-                                        };
+                                <div key={sim.merchantSimId} className="space-y-2 md:col-span-2 grid gap-2 md:grid-cols-2">
+                                  <div>
+                                    <Label htmlFor={fieldKey}>{sim.simName} E-Cash (GHS) *</Label>
+                                    <Input
+                                      id={fieldKey}
+                                      type="text"
+                                      inputMode="decimal"
+                                      value={value}
+                                      onChange={(e) => {
+                                        const updated = { ...formData.closingMerchantSimEcash, [sim.merchantSimId]: e.target.value };
                                         setFormData({ ...formData, closingMerchantSimEcash: updated });
-                                      }
-                                    }}
-                      required
-                    />
-                                  {expectedValue > 0 && (
-                      <p className="text-xs text-muted-foreground">
-                                      Expected (from Reconciliation): GHS {expectedValue.toFixed(2)}
-                      </p>
-                    )}
-                  </div>
+                                      }}
+                                      onBlur={(e) => {
+                                        const num = parseFloat(e.target.value);
+                                        if (!isNaN(num)) {
+                                          const updated = { ...formData.closingMerchantSimEcash, [sim.merchantSimId]: num.toFixed(2) };
+                                          setFormData({ ...formData, closingMerchantSimEcash: updated });
+                                        }
+                                      }}
+                                      required
+                                    />
+                                    {expectedValue > 0 && <p className="text-xs text-muted-foreground">Expected: GHS {expectedValue.toFixed(2)}</p>}
+                                  </div>
+                                  <div>
+                                    <Label htmlFor={`closing_physical_${sim.merchantSimId}`}>{sim.simName} Physical Cash (GHS)</Label>
+                                    <Input
+                                      id={`closing_physical_${sim.merchantSimId}`}
+                                      type="text"
+                                      inputMode="decimal"
+                                      value={physicalValue}
+                                      onChange={(e) => {
+                                        const updated = { ...formData.closingMerchantSimPhysicalCash, [sim.merchantSimId]: e.target.value };
+                                        setFormData({ ...formData, closingMerchantSimPhysicalCash: updated });
+                                      }}
+                                      onBlur={(e) => {
+                                        const num = parseFloat(e.target.value);
+                                        if (!isNaN(num)) {
+                                          const updated = { ...formData.closingMerchantSimPhysicalCash, [sim.merchantSimId]: num.toFixed(2) };
+                                          setFormData({ ...formData, closingMerchantSimPhysicalCash: updated });
+                                        }
+                                      }}
+                                    />
+                                    {expectedPhysical > 0 && <p className="text-xs text-muted-foreground">Expected: GHS {expectedPhysical.toFixed(2)}</p>}
+                                  </div>
+                                </div>
                               );
                             })}
                           </div>
@@ -1072,6 +1629,44 @@ export default function FloatManagement() {
                   })}
                 </div>
               </div>
+
+              {/* Closing Bank Balances – includes banks with no opening float (e.g. received transfer from SIM) */}
+              {expectedBalances.bankBalances && typeof expectedBalances.bankBalances === "object" && Object.keys(expectedBalances.bankBalances).length > 0 && (
+                <div className="border-t pt-4">
+                  <h3 className="text-lg font-semibold mb-4">Closing Bank Balances (GHS)</h3>
+                  <p className="text-sm text-muted-foreground mb-3">Banks that had activity (e.g. SIM→Bank or Bank→SIM transfers) — enter actual closing balance for each.</p>
+                  <div className="grid gap-4 md:grid-cols-2">
+                    {Object.keys(expectedBalances.bankBalances).map((bankName) => {
+                      const expectedVal = expectedBalances.bankBalances[bankName];
+                      const value = formData.closingBankBalances?.[bankName] ?? "";
+                      return (
+                        <div key={bankName} className="space-y-2">
+                          <Label htmlFor={`closing_bank_${bankName}`}>{bankName}</Label>
+                          <Input
+                            id={`closing_bank_${bankName}`}
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            value={value}
+                            onChange={(e) => {
+                              const updated = { ...formData.closingBankBalances, [bankName]: e.target.value };
+                              setFormData({ ...formData, closingBankBalances: updated });
+                            }}
+                            onBlur={(e) => {
+                              const num = parseFloat(e.target.value);
+                              if (!isNaN(num) && num >= 0) {
+                                const updated = { ...formData.closingBankBalances, [bankName]: num.toFixed(2) };
+                                setFormData({ ...formData, closingBankBalances: updated });
+                              }
+                            }}
+                          />
+                          <p className="text-xs text-muted-foreground">Expected: GHS {(expectedVal ?? 0).toFixed(2)}</p>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
 
               {hasClosingValues && (
                 <div className="border-t pt-4">
@@ -1150,151 +1745,6 @@ export default function FloatManagement() {
                   </div>
                 </div>
               )}
-
-              <div className="border-t pt-4">
-                <h3 className="text-lg font-semibold mb-4">Cash Banking</h3>
-                <div className="space-y-4">
-                  {formData.cashBanked && formData.cashBanked.length > 0 && (
-                    <div className="space-y-3">
-                      {formData.cashBanked.map((transaction, index) => (
-                        <div key={index} className="border rounded-md p-4 bg-muted/50">
-                          <div className="grid gap-4 md:grid-cols-4 items-end">
-                  <div className="space-y-2">
-                              <Label>Bank Name</Label>
-                              <Select
-                                value={transaction.bankName || ""}
-                                onChange={(e) => {
-                                  const updated = [...formData.cashBanked];
-                                  updated[index] = { ...updated[index], bankName: e.target.value, transactionType: "", amount: "" };
-                                  setFormData({ ...formData, cashBanked: updated });
-                                }}
-                              >
-                                <option value="">Select Bank</option>
-                                {banks.map((bank) => (
-                                  <option key={bank} value={bank}>
-                                    {bank}
-                                  </option>
-                                ))}
-                              </Select>
-                  </div>
-                            {transaction.bankName && (
-                  <div className="space-y-2">
-                                <Label>Transaction Type</Label>
-                                <Select
-                                  value={transaction.transactionType || ""}
-                                  onChange={(e) => {
-                                    const updated = [...formData.cashBanked];
-                                    updated[index] = { ...updated[index], transactionType: e.target.value, amount: "" };
-                                    setFormData({ ...formData, cashBanked: updated });
-                                  }}
-                                >
-                                  <option value="">Select Type</option>
-                                  <option value="deposit">Deposit</option>
-                                  <option value="withdrawal">Withdrawal</option>
-                                </Select>
-                  </div>
-                            )}
-                            {transaction.bankName && transaction.transactionType && (
-                  <div className="space-y-2">
-                                <Label>Amount (GHS)</Label>
-                    <Input
-                                  type="number"
-                                  step="0.01"
-                                  value={transaction.amount || ""}
-                                  onChange={(e) => {
-                                    const updated = [...formData.cashBanked];
-                                    updated[index] = { ...updated[index], amount: e.target.value };
-                                    setFormData({ ...formData, cashBanked: updated });
-                                  }}
-                                  placeholder="Enter amount"
-                    />
-                  </div>
-                            )}
-                            <div className="flex items-end">
-                              <Button
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                onClick={() => {
-                                  const updated = formData.cashBanked.filter((_, i) => i !== index);
-                                  setFormData({ ...formData, cashBanked: updated });
-                                }}
-                                className="text-red-600 hover:text-red-700"
-                              >
-                                Remove
-                              </Button>
-                  </div>
-                  </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => {
-                      setFormData({
-                        ...formData,
-                        cashBanked: [...(formData.cashBanked || []), { bankName: "", transactionType: "", amount: "" }],
-                      });
-                    }}
-                  >
-                    <Plus className="h-4 w-4 mr-2" />
-                    Add Bank Transaction
-                  </Button>
-                </div>
-              </div>
-
-              <div className="border-t pt-4">
-                <h3 className="text-lg font-semibold mb-4">E-Cash Transfers (if any)</h3>
-                <div className="grid gap-4 md:grid-cols-2">
-                  <div className="space-y-2">
-                    <Label htmlFor="ecashSentToHQ">Amount Sent to HQ (GHS)</Label>
-                    <Input
-                      id="ecashSentToHQ"
-                      type="number"
-                      step="0.01"
-                      value={formData.ecashSentToHQ}
-                      onChange={(e) =>
-                        setFormData({ ...formData, ecashSentToHQ: e.target.value })
-                      }
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="ecashSentToBranch">Amount Sent to Other Branch (GHS)</Label>
-                    <Input
-                      id="ecashSentToBranch"
-                      type="number"
-                      step="0.01"
-                      value={formData.ecashSentToBranch}
-                      onChange={(e) =>
-                        setFormData({ ...formData, ecashSentToBranch: e.target.value })
-                      }
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="ecashRecipient">Recipient</Label>
-                    <Input
-                      id="ecashRecipient"
-                      value={formData.ecashRecipient}
-                      onChange={(e) =>
-                        setFormData({ ...formData, ecashRecipient: e.target.value })
-                      }
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="ecashReference">Reference Number</Label>
-                    <Input
-                      id="ecashReference"
-                      value={formData.ecashReference}
-                      onChange={(e) =>
-                        setFormData({ ...formData, ecashReference: e.target.value })
-                      }
-                    />
-                  </div>
-                </div>
-              </div>
 
               {variancePercentage > 2 && (
                 <div className="border-t pt-4">
@@ -1378,21 +1828,22 @@ export default function FloatManagement() {
               </div>
             )}
 
-            {/* Approval Section - Only show for branch admin/manager and flagged floats */}
-            {todayFloat.status === "flagged" && 
-             (userData?.role === "branch_manager" || userData?.role === "admin") &&
-             userData?.branchId === branchId && (
+        {/* Approval Section - branch manager (own branch) or admin (any) can approve closed floats */}
+        {todayFloat.status !== "approved" &&
+         ((userData?.role === "branch_manager" && userData?.branchId === branchId) || userData?.role === "admin") && (
               <div className="border-t pt-4">
                 <h3 className="text-lg font-semibold mb-4">Variance Approval</h3>
                 <div className="space-y-4">
-                  <div className="p-4 bg-yellow-50 border border-yellow-200 rounded-md">
-                    <p className="text-sm font-semibold text-yellow-800 mb-2">
-                      ⚠️ This float has been flagged due to major variance ({parseFloat(todayFloat.variancePercentage || 0).toFixed(2)}%)
-                    </p>
-                    <p className="text-sm text-yellow-700">
-                      Variance: GHS {parseFloat(todayFloat.variance || 0).toLocaleString()}
-                    </p>
-                  </div>
+              {parseFloat(todayFloat.variance || 0) !== 0 && (
+                <div className="p-4 bg-yellow-50 border border-yellow-200 rounded-md">
+                  <p className="text-sm font-semibold text-yellow-800 mb-2">
+                    ⚠️ This float has been flagged due to variance ({parseFloat(todayFloat.variancePercentage || 0).toFixed(2)}%)
+                  </p>
+                  <p className="text-sm text-yellow-700">
+                    Variance: GHS {parseFloat(todayFloat.variance || 0).toLocaleString()}
+                  </p>
+                </div>
+              )}
                   
                   <div className="space-y-2">
                     <Label htmlFor="approvalComments">Approval Comments (Optional)</Label>
@@ -1407,14 +1858,6 @@ export default function FloatManagement() {
                   </div>
 
                   <div className="flex gap-4">
-                    <Button
-                      type="button"
-                      onClick={handleApproveVariance}
-                      disabled={loading}
-                      className="bg-green-600 hover:bg-green-700"
-                    >
-                      {loading ? "Approving..." : "Approve Variance"}
-                    </Button>
                     <Button
                       type="button"
                       variant="outline"
@@ -1464,16 +1907,12 @@ export default function FloatManagement() {
                 <TableHead>Closing Cash</TableHead>
                 <TableHead>Variance</TableHead>
                 <TableHead>Status</TableHead>
-                {(userData?.role === "branch_manager" || userData?.role === "admin") &&
-                 userData?.branchId === branchId && (
-                  <TableHead>Actions</TableHead>
-                )}
               </TableRow>
             </TableHeader>
             <TableBody>
               {floatHistory.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={((userData?.role === "branch_manager" || userData?.role === "admin") && userData?.branchId === branchId) ? 6 : 5} className="text-center">
+                  <TableCell colSpan={5} className="text-center">
                     No float records found
                   </TableCell>
                 </TableRow>
@@ -1494,7 +1933,30 @@ export default function FloatManagement() {
                       }
                     }
                   }
-                  
+
+                  // Derive a clearer status for display:
+                  // - "Pending Close"  => no closing values entered yet
+                  // - "Pending Approval" => closed, zero variance, waiting for manager/admin
+                  // - "Variance Flagged"  => closed, non‑zero variance
+                  // - "Approved"          => variance approved
+                  const hasClosing = !!float.closingPhysicalCash && float.closingPhysicalCash !== "";
+                  let statusLabel = "Pending Close";
+                  let statusVariant = "secondary";
+
+                  if (hasClosing) {
+                    if (float.status === "approved") {
+                      statusLabel = "Approved";
+                      statusVariant = "default";
+                    } else if (float.status === "flagged") {
+                      statusLabel = "Variance Flagged";
+                      statusVariant = "destructive";
+                    } else {
+                      // status "pending" after closing now means: pending variance approval
+                      statusLabel = "Pending Approval";
+                      statusVariant = "secondary";
+                    }
+                  }
+
                   return (
                   <TableRow key={float.id}>
                     <TableCell>
@@ -1520,37 +1982,8 @@ export default function FloatManagement() {
                       </span>
                     </TableCell>
                     <TableCell>
-                      <Badge
-                        variant={
-                          float.status === "approved"
-                            ? "default"
-                            : float.status === "flagged"
-                            ? "destructive"
-                            : "secondary"
-                        }
-                      >
-                        {float.status}
-                      </Badge>
+                      <Badge variant={statusVariant}>{statusLabel}</Badge>
                     </TableCell>
-                    {(userData?.role === "branch_manager" || userData?.role === "admin") &&
-                     userData?.branchId === branchId && (
-                      <TableCell>
-                        {float.status === "flagged" ? (
-                          <Button
-                            size="sm"
-                            onClick={() => handleApproveVarianceFromHistory(float)}
-                            disabled={loading}
-                            className="bg-green-600 hover:bg-green-700"
-                          >
-                            Approve
-                          </Button>
-                        ) : float.status === "approved" ? (
-                          <span className="text-sm text-green-600">✓ Approved</span>
-                        ) : (
-                          <span className="text-sm text-muted-foreground">-</span>
-                        )}
-                      </TableCell>
-                    )}
                   </TableRow>
                   );
                 })
@@ -1559,6 +1992,385 @@ export default function FloatManagement() {
           </Table>
         </CardContent>
       </Card>
+      {/* Pending Floats Modal - Only show floats from previous days (not today) */}
+      {showPendingFloatsModal && (() => {
+        const today = new Date().toISOString().split("T")[0];
+        const previousDayFloats = pendingFloats.filter(float => {
+          const floatDate = float.date?.toDate ? float.date.toDate().toISOString().split("T")[0] : 
+                           (typeof float.date === 'string' ? float.date : new Date(float.date).toISOString().split("T")[0]);
+          return floatDate !== today;
+        });
+        
+        // Don't show modal if there are no previous day floats
+        if (previousDayFloats.length === 0) {
+          return null;
+        }
+        
+        return (
+          <div 
+            className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4"
+            onClick={(e) => {
+              // Prevent closing by clicking outside
+              if (e.target === e.currentTarget) {
+                e.preventDefault();
+                e.stopPropagation();
+              }
+            }}
+          >
+            <Card className="w-full max-w-3xl max-h-[90vh] overflow-y-auto">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <AlertCircle className="h-5 w-5 text-yellow-600" />
+                  Pending Floats to Close
+                </CardTitle>
+                <p className="text-sm text-muted-foreground">
+                  You have {previousDayFloats.length} unclosed float(s) from previous days. Please close them before creating a new opening float.
+                </p>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-3">
+                  {previousDayFloats.map((float) => {
+                    const floatDate = float.date?.toDate ? float.date.toDate().toLocaleDateString() : new Date(float.date).toLocaleDateString();
+                    return (
+                      <div
+                        key={float.floatId}
+                        onClick={() => handleSelectPendingFloat(float)}
+                        className="p-4 border rounded-md cursor-pointer hover:bg-accent transition-colors"
+                      >
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <h3 className="font-semibold">Float from {floatDate}</h3>
+                            <p className="text-sm text-muted-foreground">
+                              Opening Physical Cash: GHS {parseFloat(float.openingPhysicalCash || 0).toLocaleString()}
+                            </p>
+                            <p className="text-sm text-muted-foreground">
+                              Status: <Badge variant={float.status === "pending" ? "default" : "destructive"}>{float.status}</Badge>
+                            </p>
+                          </div>
+                          <Button variant="outline">Close Float</Button>
+                        </div>
+    </div>
+  );
+                  })}
+                </div>
+                <div className="flex justify-end gap-4 mt-6">
+                  <p className="text-sm text-muted-foreground flex-1">
+                    ⚠️ You must close all pending floats from previous days before creating a new opening float. Please select a float above to close it.
+                  </p>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        );
+      })()}
+
+      {/* Close Pending Float Modal */}
+      {showCloseFloatModal && selectedPendingFloat && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 overflow-y-auto">
+          <Card className="w-full max-w-4xl max-h-[90vh] overflow-y-auto my-4">
+            <CardHeader>
+              <CardTitle>Close Float - {selectedPendingFloat.date?.toDate ? selectedPendingFloat.date.toDate().toLocaleDateString() : new Date(selectedPendingFloat.date).toLocaleDateString()}</CardTitle>
+              <p className="text-sm text-muted-foreground">
+                Complete the closing form to close this pending float.
+              </p>
+            </CardHeader>
+            <CardContent>
+              <form onSubmit={handleClosingSubmit} className="space-y-6">
+                {/* Reuse the same closing form structure from mode === "closing" */}
+                <div className="border-t pt-4">
+                  <h3 className="text-lg font-semibold mb-4">Closing Balances</h3>
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <Label htmlFor="modalClosingPhysicalCash">Physical Cash in Hand (GHS) *</Label>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={async () => {
+                            await calculateExpectedBalances();
+                            setTimeout(() => {
+                              const merchantSimEcash = {};
+                              if (expectedBalances.merchantSimEcash && typeof expectedBalances.merchantSimEcash === 'object') {
+                                Object.keys(expectedBalances.merchantSimEcash).forEach(simId => {
+                                  const expectedValue = expectedBalances.merchantSimEcash[simId];
+                                  if (expectedValue !== undefined && expectedValue !== null && !isNaN(expectedValue)) {
+                                    merchantSimEcash[simId] = parseFloat(expectedValue).toFixed(2);
+                                  }
+                                });
+                              }
+                              setFormData(prev => ({
+                                ...prev,
+                                closingPhysicalCash: expectedBalances.physicalCash.toFixed(2),
+                                closingMerchantSimEcash: { ...prev.closingMerchantSimEcash, ...merchantSimEcash },
+                              }));
+                            }, 100);
+                          }}
+                        >
+                          🔄 Sync with Reconciliation
+                        </Button>
+                      </div>
+                      <Input
+                        id="modalClosingPhysicalCash"
+                        type="number"
+                        step="0.01"
+                        value={formData.closingPhysicalCash}
+                        onChange={(e) => setFormData({ ...formData, closingPhysicalCash: e.target.value })}
+                        required
+                      />
+                      {expectedBalances.physicalCash > 0 && (
+                        <p className="text-sm text-muted-foreground">
+                          Expected (from Reconciliation): GHS {expectedBalances.physicalCash.toFixed(2)}
+                        </p>
+                      )}
+                    </div>
+                    {/* Merchant SIM E-Cash sections per provider for closing */}
+                    {["MTN", "AirtelTigo", "Telecel"].map((provider) => {
+                      const providerSims = merchantSims.filter(sim => sim.provider === provider);
+                      return (
+                        <div key={provider} className="col-span-2 border rounded-md p-4 space-y-3">
+                          <div className="flex items-center justify-between">
+                            <h4 className="font-semibold">{provider} E-Cash</h4>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() => {
+                                setNewMerchantSim({ provider, simName: "", agentNumber: "" });
+                                setShowAddMerchantSim({ provider, visible: true });
+                              }}
+                            >
+                              <Plus className="h-4 w-4 mr-1" /> Add {provider} SIM
+                            </Button>
+                          </div>
+                          {providerSims.length === 0 ? (
+                            <p className="text-sm text-muted-foreground">No {provider} merchant SIMs added yet. Click "+" to add.</p>
+                          ) : (
+                            <div className="grid gap-3 md:grid-cols-2">
+                              {providerSims.map((sim) => {
+                                const fieldKey = `modal_closing_${sim.merchantSimId}`;
+                                const value = formData.closingMerchantSimEcash?.[sim.merchantSimId] || "";
+                                const expectedValue = expectedBalances.merchantSimEcash?.[sim.merchantSimId] || 0;
+                                const physicalValue = formData.closingMerchantSimPhysicalCash?.[sim.merchantSimId] ?? "";
+                                const expectedPhysical = expectedBalances.merchantSimPhysicalCash?.[sim.merchantSimId] ?? 0;
+                                return (
+                                  <div key={sim.merchantSimId} className="space-y-2 md:col-span-2 grid gap-2 md:grid-cols-2">
+                                    <div>
+                                      <Label htmlFor={fieldKey}>{sim.simName} E-Cash (GHS) *</Label>
+                                      <Input
+                                        id={fieldKey}
+                                        type="text"
+                                        inputMode="decimal"
+                                        value={value}
+                                        onChange={(e) => {
+                                          const updated = { ...formData.closingMerchantSimEcash, [sim.merchantSimId]: e.target.value };
+                                          setFormData({ ...formData, closingMerchantSimEcash: updated });
+                                        }}
+                                        onBlur={(e) => {
+                                          const num = parseFloat(e.target.value);
+                                          if (!isNaN(num)) {
+                                            const updated = { ...formData.closingMerchantSimEcash, [sim.merchantSimId]: num.toFixed(2) };
+                                            setFormData({ ...formData, closingMerchantSimEcash: updated });
+                                          }
+                                        }}
+                                        required
+                                      />
+                                      {expectedValue > 0 && <p className="text-xs text-muted-foreground">Expected: GHS {expectedValue.toFixed(2)}</p>}
+                                    </div>
+                                    <div>
+                                      <Label htmlFor={`modal_closing_physical_${sim.merchantSimId}`}>{sim.simName} Physical Cash (GHS)</Label>
+                                      <Input
+                                        id={`modal_closing_physical_${sim.merchantSimId}`}
+                                        type="text"
+                                        inputMode="decimal"
+                                        value={physicalValue}
+                                        onChange={(e) => {
+                                          const updated = { ...formData.closingMerchantSimPhysicalCash, [sim.merchantSimId]: e.target.value };
+                                          setFormData({ ...formData, closingMerchantSimPhysicalCash: updated });
+                                        }}
+                                        onBlur={(e) => {
+                                          const num = parseFloat(e.target.value);
+                                          if (!isNaN(num)) {
+                                            const updated = { ...formData.closingMerchantSimPhysicalCash, [sim.merchantSimId]: num.toFixed(2) };
+                                            setFormData({ ...formData, closingMerchantSimPhysicalCash: updated });
+                                          }
+                                        }}
+                                      />
+                                      {expectedPhysical > 0 && <p className="text-xs text-muted-foreground">Expected: GHS {expectedPhysical.toFixed(2)}</p>}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                          {showAddMerchantSim.visible && showAddMerchantSim.provider === provider && (
+                            <div className="p-3 border rounded-md bg-muted space-y-2">
+                              <Input
+                                placeholder={`${provider} SIM Name (e.g., ${provider}33)`}
+                                value={newMerchantSim.simName}
+                                onChange={(e) => setNewMerchantSim({ ...newMerchantSim, simName: e.target.value })}
+                              />
+                              <Input
+                                placeholder="Agent Number (optional)"
+                                value={newMerchantSim.agentNumber}
+                                onChange={(e) => setNewMerchantSim({ ...newMerchantSim, agentNumber: e.target.value })}
+                              />
+                              <div className="flex gap-2">
+                                <Button type="button" size="sm" onClick={handleAddMerchantSim}>
+                                  Add
+                                </Button>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => {
+                                    setShowAddMerchantSim({ provider: "", visible: false });
+                                    setNewMerchantSim({ provider: "", simName: "", agentNumber: "" });
+                                  }}
+                                >
+                                  Cancel
+                                </Button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Variance Analysis - only show if values entered */}
+                {hasClosingValues && totalVariance > 0 && (
+                  <div className="border-t pt-4">
+                    <h3 className="text-lg font-semibold mb-4">Variance Analysis</h3>
+                    <div className={`space-y-2 p-4 border rounded-md ${
+                      totalVariance === 0 
+                        ? "bg-green-50 border-green-200" 
+                        : variancePercentage > 2 
+                          ? "bg-red-50 border-red-200" 
+                          : "bg-yellow-50 border-yellow-200"
+                    }`}>
+                      <div className="flex items-center gap-2">
+                        {totalVariance === 0 ? (
+                          <CheckCircle className="h-5 w-5 text-green-600" />
+                        ) : variancePercentage > 2 ? (
+                          <XCircle className="h-5 w-5 text-red-600" />
+                        ) : (
+                          <AlertCircle className="h-5 w-5 text-yellow-600" />
+                        )}
+                        <span className="font-semibold">
+                          Total Variance: GHS {totalVariance > 0 ? "+" : ""}{totalVariance.toLocaleString()} ({variancePercentage.toFixed(2)}%)
+                        </span>
+                      </div>
+                      <div className="space-y-2">
+                        <div>
+                          <Label htmlFor="modalVarianceReason">Variance Reason *</Label>
+                          <Input
+                            id="modalVarianceReason"
+                            value={formData.varianceReason}
+                            onChange={(e) => setFormData({ ...formData, varianceReason: e.target.value })}
+                            required
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex justify-end gap-4 border-t pt-4">
+                  <Button type="button" variant="outline" onClick={() => {
+                    setShowCloseFloatModal(false);
+                    setSelectedPendingFloat(null);
+                    setTodayFloat(null);
+                  }}>
+                    Cancel
+                  </Button>
+                  <Button type="submit" disabled={loading}>
+                    {loading ? "Closing..." : "Close Float"}
+                  </Button>
+                </div>
+              </form>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
+      {/* Good Evening Modal */}
+      {showGoodEveningModal && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center">
+          <Card className="w-full max-w-md mx-4">
+            <CardContent className="pt-6">
+              <div className="text-center space-y-4">
+                <div className="text-6xl">🌙</div>
+                <h2 className="text-2xl font-bold">Have a Good Evening!</h2>
+                <p className="text-muted-foreground">
+                  Your float has been closed for today. All activities are now locked until a new day begins.
+                </p>
+                <Button
+                  onClick={() => setShowGoodEveningModal(false)}
+                  className="w-full"
+                >
+                  Close
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
+      {/* Good Morning Modal */}
+      {showGoodMorningModal && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center">
+          <Card className="w-full max-w-md mx-4">
+            <CardContent className="pt-6">
+              <div className="text-center space-y-4">
+                <div className="text-6xl">☀️</div>
+                <h2 className="text-2xl font-bold">Good Morning!</h2>
+                <p className="text-muted-foreground">
+                  Your opening float has been created. You can now start day operations.
+                </p>
+                <Button
+                  onClick={() => setShowGoodMorningModal(false)}
+                  className="w-full"
+                >
+                  Start Day
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
+      {/* Block UI if float is closed for today */}
+      {isFloatClosedToday && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-40 flex items-center justify-center pointer-events-auto">
+          <Card className="w-full max-w-md mx-4 pointer-events-auto">
+            <CardContent className="pt-6">
+              <div className="text-center space-y-4">
+                <div className="text-6xl">🔒</div>
+                <h2 className="text-2xl font-bold">Day Closed</h2>
+                <p className="text-muted-foreground">
+                  Today's float has been closed. All activities are locked until a new day begins.
+                </p>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
+      {showTopUpModal && (
+        <TopUpModal
+          branchId={branchId}
+          businessId={businessId}
+          userId={userData?.userId}
+          userName={userData?.name || userData?.email}
+          currentBalances={expectedBalances}
+          onClose={() => setShowTopUpModal(false)}
+          onSuccess={() => {
+            calculateExpectedBalances();
+          }}
+        />
+      )}
     </div>
   );
 }

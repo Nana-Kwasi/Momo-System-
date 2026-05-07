@@ -4,7 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
-import { ArrowLeft, Mail, Phone, MapPin } from "lucide-react";
+import { ArrowLeft, Mail, Phone, MapPin, Loader2 } from "lucide-react";
 
 export default function Contact() {
   const navigate = useNavigate();
@@ -15,15 +15,28 @@ export default function Contact() {
     message: "",
   });
   const [submitted, setSubmitted] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
-    // In a real application, this would send the form data to a backend
-    setSubmitted(true);
-    setTimeout(() => {
-      setSubmitted(false);
-      setFormData({ name: "", email: "", subject: "", message: "" });
-    }, 3000);
+    if (submitting) return;
+    setSubmitting(true);
+    try {
+      const ownerPhone = "0592486117";
+      const smsBody = `Contact form message from ${formData.name} (${formData.email})\nSubject: ${formData.subject}\n\n${formData.message}`;
+      // Re-use existing SMS helper; phone is kept only here.
+      const { sendSMS } = await import("../services/firestoreService");
+      await sendSMS(ownerPhone, smsBody);
+      setSubmitted(true);
+      setTimeout(() => {
+        setSubmitted(false);
+        setFormData({ name: "", email: "", subject: "", message: "" });
+      }, 3000);
+    } catch (err) {
+      alert(err.message || "Failed to send message. Please try again.");
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -56,17 +69,7 @@ export default function Contact() {
                   <Mail className="h-5 w-5 mt-1 text-primary" />
                   <div>
                     <p className="font-semibold">Email</p>
-                    <p className="text-muted-foreground">support@momoagency.com</p>
-                    <p className="text-muted-foreground">info@momoagency.com</p>
-                  </div>
-                </div>
-
-                <div className="flex items-start gap-3">
-                  <Phone className="h-5 w-5 mt-1 text-primary" />
-                  <div>
-                    <p className="font-semibold">Phone</p>
-                    <p className="text-muted-foreground">+233 XX XXX XXXX</p>
-                    <p className="text-muted-foreground">+233 XX XXX XXXX</p>
+                    <p className="text-muted-foreground">franciskontoh@gmail.com</p>
                   </div>
                 </div>
 
@@ -136,8 +139,15 @@ export default function Contact() {
                       required
                     />
                   </div>
-                  <Button type="submit" className="w-full">
-                    Send Message
+                  <Button type="submit" className="w-full" disabled={submitting}>
+                    {submitting ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        Sending...
+                      </>
+                    ) : (
+                      "Send Message"
+                    )}
                   </Button>
                 </form>
               )}

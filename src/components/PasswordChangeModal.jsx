@@ -6,9 +6,9 @@ import { Label } from "./ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./ui/card";
 import { AlertCircle } from "lucide-react";
 
-export default function PasswordChangeModal({ onPasswordChanged }) {
+export default function PasswordChangeModal({ onPasswordChanged, fromSettings }) {
   const { changePassword } = useAuth();
-  const [oldPassword, setOldPassword] = useState("AFB12345");
+  const [oldPassword, setOldPassword] = useState(fromSettings ? "" : "AFB12345");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState("");
@@ -29,7 +29,12 @@ export default function PasswordChangeModal({ onPasswordChanged }) {
     }
 
     if (newPassword === oldPassword) {
-      setError("New password must be different from default password");
+      setError("New password must be different from current password");
+      return;
+    }
+
+    if (fromSettings && !oldPassword.trim()) {
+      setError("Enter your current password");
       return;
     }
 
@@ -47,9 +52,9 @@ export default function PasswordChangeModal({ onPasswordChanged }) {
   };
 
   return (
-    <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-      <Card className="w-full max-w-md">
-        <CardHeader>
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+      <Card className="w-full max-w-md shadow-xl border-2 rounded-xl">
+        <CardHeader className="border-b border-border">
           <div className="flex items-center gap-2 text-yellow-600">
             <AlertCircle className="h-5 w-5" />
             <CardTitle>Password Change Required</CardTitle>
@@ -66,14 +71,15 @@ export default function PasswordChangeModal({ onPasswordChanged }) {
               </div>
             )}
             <div className="space-y-2">
-              <Label htmlFor="oldPassword">Current Password (Default: AFB12345)</Label>
+              <Label htmlFor="oldPassword">{fromSettings ? "Current Password" : "Current Password (Default: AFB12345)"}</Label>
               <Input
                 id="oldPassword"
                 type="password"
                 value={oldPassword}
                 onChange={(e) => setOldPassword(e.target.value)}
                 required
-                disabled
+                disabled={!fromSettings}
+                placeholder={fromSettings ? "Enter current password" : undefined}
               />
             </div>
             <div className="space-y-2">

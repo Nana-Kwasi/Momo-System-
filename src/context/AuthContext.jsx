@@ -7,8 +7,9 @@ import {
   reauthenticateWithCredential,
   EmailAuthProvider,
 } from "firebase/auth";
-import { doc, getDoc, updateDoc, Timestamp } from "firebase/firestore";
+import { doc, getDoc, updateDoc, Timestamp, collection, query, where, getDocs } from "firebase/firestore";
 import { auth, db } from "../lib/firebase";
+import { otpDisableService } from "../services/firestoreService";
 
 const AuthContext = createContext({});
 
@@ -57,14 +58,57 @@ export const AuthProvider = ({ children }) => {
     return unsubscribe;
   }, []);
 
-  const login = async (email, password) => {
+  const login = async (email, password, options = {}) => {
+    const { skipOtp = false } = options;
     const userCredential = await signInWithEmailAndPassword(auth, email, password);
     const userDoc = await getDoc(doc(db, "users", userCredential.user.uid));
-    
+
     if (userDoc.exists()) {
       const userData = userDoc.data();
+      if (userData.status === "locked") {
+        await signOut(auth);
+        throw new Error("Your account has been locked. Contact IT Admin.");
+      }
+      if (userData.role !== "it_admin" && (userData.businessId || userData.branchId)) {
+        if (userData.businessId) {
+          const bq = query(collection(db, "agent_businesses"), where("businessId", "==", userData.businessId));
+          const bSnap = await getDocs(bq);
+          if (!bSnap.empty) {
+            const biz = bSnap.docs[0].data();
+            if (biz.status === "locked" || biz.status === "deleted") {
+              await signOut(auth);
+              throw new Error(biz.status === "deleted" ? "Business account has been deleted. Contact IT Admin." : "Business account is locked. Contact IT Admin.");
+            }
+          }
+        }
+        if (userData.branchId) {
+          const brq = query(collection(db, "branches"), where("branchId", "==", userData.branchId));
+          const brSnap = await getDocs(brq);
+          if (!brSnap.empty) {
+            const br = brSnap.docs[0].data();
+            if (br.status === "locked" || br.status === "suspended") {
+              await signOut(auth);
+              throw new Error(br.status === "suspended" ? "Branch is suspended. Contact IT Admin." : "Branch is locked. Contact IT Admin.");
+            }
+          }
+        }
+      }
+
+      if (!skipOtp) {
+        const otpDisabled = await otpDisableService.checkActive((email || "").toLowerCase().trim());
+        if (!otpDisabled) {
+          await signOut(auth);
+          return {
+            requiresOtp: true,
+            userData,
+            userDocId: userCredential.user.uid,
+            email,
+          };
+        }
+      }
+
       setUserData(userData);
-      
+
       await updateDoc(doc(db, "users", userCredential.user.uid), {
         lastLogin: Timestamp.now(),
       });
@@ -83,7 +127,7 @@ export const AuthProvider = ({ children }) => {
         }
       }
     }
-    
+
     return { requiresPasswordChange: false, userCredential };
   };
 
@@ -108,6 +152,16 @@ export const AuthProvider = ({ children }) => {
     if (branchId) sessionStorage.setItem("selectedBranchId", branchId);
   };
 
+  const updateMyProfile = async (updates) => {
+    if (!currentUser) throw new Error("Not logged in");
+    await updateDoc(doc(db, "users", currentUser.uid), {
+      ...updates,
+      updatedAt: Timestamp.now(),
+    });
+    const userDoc = await getDoc(doc(db, "users", currentUser.uid));
+    if (userDoc.exists()) setUserData(userDoc.data());
+  };
+
   const logout = async () => {
     await signOut(auth);
     setUserData(null);
@@ -123,6 +177,7 @@ export const AuthProvider = ({ children }) => {
     login,
     logout,
     changePassword,
+    updateMyProfile,
     loading,
     selectedBusinessId,
     selectedBranchId,

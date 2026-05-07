@@ -32,7 +32,7 @@ export default function BusinessSelectionModal({ onSelect, onCancel }) {
 
   if (loading) {
     return (
-      <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+      <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
         <Card className="w-full max-w-2xl">
           <CardContent className="pt-6">
             <div className="text-center py-8">
@@ -46,7 +46,7 @@ export default function BusinessSelectionModal({ onSelect, onCancel }) {
   }
 
   return (
-    <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
       <Card className="w-full max-w-2xl">
         <CardHeader>
           <CardTitle>Select Business</CardTitle>

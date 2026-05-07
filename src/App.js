@@ -18,6 +18,9 @@ import SeedAdmin from "./pages/SeedAdmin";
 import AboutUs from "./pages/AboutUs";
 import Contact from "./pages/Contact";
 import Disbursement from "./pages/Disbursement";
+import ReconciliationApprovals from "./pages/ReconciliationApprovals";
+import CommissionSettings from "./pages/CommissionSettings";
+import Settings from "./pages/Settings";
 
 const queryClient = new QueryClient();
 
@@ -44,7 +47,7 @@ function App() {
               <Route
                 path="businesses"
                 element={
-                  <ProtectedRoute allowedRoles={["it_admin"]}>
+                  <ProtectedRoute allowedRoles={["it_admin", "admin"]}>
                     <BusinessRegistration />
                   </ProtectedRoute>
                 }
@@ -67,7 +70,23 @@ function App() {
               />
               <Route path="float" element={<FloatManagement />} />
               <Route path="reconciliation" element={<Reconciliation />} />
+              <Route
+                path="reconciliation-approvals"
+                element={
+                  <ProtectedRoute allowedRoles={["branch_manager"]}>
+                    <ReconciliationApprovals />
+                  </ProtectedRoute>
+                }
+              />
               <Route path="transactions" element={<Transactions />} />
+              <Route
+                path="commission-settings"
+                element={
+                  <ProtectedRoute allowedRoles={["it_admin", "admin", "branch_manager"]}>
+                    <CommissionSettings />
+                  </ProtectedRoute>
+                }
+              />
               <Route
                 path="disbursement"
                 element={
@@ -85,6 +104,7 @@ function App() {
                   </ProtectedRoute>
                 }
               />
+              <Route path="settings" element={<Settings />} />
             </Route>
           </Routes>
         </Router>
